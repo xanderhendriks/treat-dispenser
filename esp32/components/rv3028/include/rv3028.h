@@ -72,6 +72,50 @@ extern "C"
      */
     esp_err_t rv3028_is_time_valid(rv3028_handle_t handle, bool *out_valid);
 
+    /**
+     * Arm the daily alarm and route it to the INT pin.
+     *
+     * The weekday and date are masked out, so the alarm matches on the hour and
+     * minute alone and therefore fires once a day. The INT pin is open drain and
+     * pulls low when the alarm hits; it releases again when the alarm flag is
+     * cleared with rv3028_clear_alarm_flag(). Any pending flag is cleared here,
+     * so arming never leaves a stale interrupt behind.
+     *
+     * @param handle Driver handle.
+     * @param hour Alarm hour, 0-23.
+     * @param minute Alarm minute, 0-59.
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG for out of range values.
+     */
+    esp_err_t rv3028_set_alarm(rv3028_handle_t handle, int hour, int minute);
+
+    /**
+     * Disarm the alarm and stop driving the INT pin from it.
+     *
+     * @param handle Driver handle.
+     * @return ESP_OK on success.
+     */
+    esp_err_t rv3028_disable_alarm(rv3028_handle_t handle);
+
+    /**
+     * Read the alarm flag.
+     *
+     * The flag latches when the alarm matches and stays set, holding INT low,
+     * until it is cleared.
+     *
+     * @param handle Driver handle.
+     * @param out_triggered Receives the flag state.
+     * @return ESP_OK on success.
+     */
+    esp_err_t rv3028_get_alarm_flag(rv3028_handle_t handle, bool *out_triggered);
+
+    /**
+     * Clear the alarm flag, releasing the INT pin.
+     *
+     * @param handle Driver handle.
+     * @return ESP_OK on success.
+     */
+    esp_err_t rv3028_clear_alarm_flag(rv3028_handle_t handle);
+
 #ifdef __cplusplus
 }
 #endif

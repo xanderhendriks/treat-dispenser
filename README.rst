@@ -6,8 +6,10 @@ drives a DC motor through a TI DRV8871 H-bridge (IN1 on GPIO4, IN2 on GPIO5)
 and a speaker through a MAX98357A I2S amplifier (BCLK on GPIO16, LRCLK on
 GPIO17, DIN on GPIO18, SD_MODE on GPIO21). An RV-3028-C7 RTC (0x52) and the
 CH224A USB-PD sink controller (0x22 or 0x23) share an I2C bus on SDA GPIO6 and
-SCL GPIO7. A 100k/27k divider (R5/R8) brings the +9V rail down to GPIO2 so the
-firmware can measure it. Developed with ESP-IDF v5.5.1.
+SCL GPIO7; the RTC drives its open drain INT pin into GPIO15 against a 4k7
+pull-up. A 100k/27k divider (R5/R8) brings the +9V rail down to GPIO2 so the
+firmware can measure it.
+Developed with ESP-IDF v5.5.1.
 
 The CH224A is strapped for single resistor configuration with a 6.8k resistor
 from CFG1 to GND, which requests 9V and enables its I2C interface. That output
@@ -75,6 +77,46 @@ then::
 Because esptool cannot reset the board either, tap RESET once more after
 flashing to boot the new firmware.
 
+Drum positioning
+----------------
+
+The drum carries one magnet per treat slot, and the DRV5055 Hall sensor sees
+each of them go by. The magnet at the home position is mounted the other way
+round, so it is the only one that reads as a negative field; every other magnet
+reads positive. ``home`` uses that to find a known starting position, driving
+past normal magnets until the negative one shows up, and ``next`` steps the
+drum on by exactly one slot regardless of polarity.
+
+Both moves brake the motor as soon as a magnet is detected and then release the
+brake, and both give up with an error if no magnet turns up within five
+seconds, which is how a jammed drum reports itself.
+
+Each move ends with a sound: reaching home plays a short tada, and reaching the
+next position plays the hook from The Longest Time twice, which is roughly how
+long it takes a dog to work out that a treat has arrived. Playback runs in the
+background, so it does not hold the move up.
+
+Feeding schedule
+----------------
+
+Treats are dispensed automatically at 07:00, 15:00 and 23:00. The RV-3028 alarm
+matches on the hour and minute with the day masked off, so it can only hold one
+time at once; the firmware arms it for the next feeding time, and re-arms it for
+the one after that every time it fires. Keeping the alarm pinned to wall clock
+times this way means the schedule cannot drift the way a repeating interval
+would.
+
+The alarm pulls the RTC INT pin low, which wakes a task that runs one ``next``
+move and then re-arms. Clearing the alarm flag is what releases INT again, so
+that happens on every path, including a failed move. The task also re-reads the
+alarm flag once a minute as a safety net, which covers the one case an edge
+cannot: a flag that was already set, and INT therefore already low, before the
+interrupt was hooked up.
+
+The schedule is computed from the RTC, so ``time_set`` re-arms the alarm for
+whatever the next feeding time is under the new clock. Without a working RTC the
+firmware still runs, but only ``home`` and ``next`` from the console.
+
 Serial console
 --------------
 
@@ -85,7 +127,7 @@ The firmware starts a console REPL on UART0. Available commands:
 - ``stop`` — stop the motor (coast)
 - ``brake`` — actively brake the motor
 - ``play <melody> <times> <0-100>`` — play a melody a number of times at the
-  given volume (melody 0 = For the Longest Time)
+  given volume (melody 0 = For the Longest Time, melody 1 = tada)
 - ``quiet`` — stop melody playback
 - ``time_set <YYYY-MM-DD> <HH:MM:SS>`` — set the RTC date and time
 - ``time_get`` — show the RTC date and time
@@ -100,4 +142,10 @@ The firmware starts a console REPL on UART0. Available commands:
 - ``supply_range [<under mV> <over mV> [<hyst mV>]]`` — show or set the
   acceptable rail voltage window
 - ``status`` — show the current speed, direction and playback state
+- ``home`` — turn the drum until it parks on the home magnet
+- ``next`` — turn the drum on to the next magnet
+- ``dispense_speed [<1-100>]`` — show or set the speed ``home`` and
+  ``next`` drive at
+- ``schedule`` — show the automatic dispensing times and the one the RTC
+  alarm is armed for
 - ``help`` — list all commands

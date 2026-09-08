@@ -2,17 +2,48 @@
 
 #include "ch224a.h"
 #include "console.h"
+#include "dispenser.h"
 #include "drv5055.h"
 #include "drv8871.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "max98357a.h"
 #include "rv3028.h"
+#include "scheduler.h"
 #include "vsense.h"
 
 /* Treat dispenser board: DRV8871 IN1 on GPIO4, IN2 on GPIO5 */
 #define MOTOR_IN1_GPIO_NUM 4
 #define MOTOR_IN2_GPIO_NUM 5
+
+/*
+ * Drum motion. The drum only ever turns one way while dispensing, and the
+ * magnets sit close enough together that a hop between two of them is well
+ * under a second at the travel speed; the timeout only has to be generous
+ * enough to tell a slow start apart from a jam.
+ */
+#define DISPENSE_DIRECTION  DRV8871_DIRECTION_REVERSE
+#define DISPENSE_SPEED_PCT  100
+#define DISPENSE_POLL_MS    10
+#define DISPENSE_TIMEOUT_MS 5000
+#define DISPENSE_BRAKE_MS   150
+
+/*
+ * A tada marks arriving at the home position, and the Billy Joel hook plays
+ * twice once a treat has been dispensed.
+ */
+#define HOME_MELODY        MAX98357A_MELODY_TADA
+#define HOME_MELODY_TIMES  1
+#define TREAT_MELODY       MAX98357A_MELODY_FOR_THE_LONGEST_TIME
+#define TREAT_MELODY_TIMES 2
+#define MELODY_VOLUME_PCT  60
+
+/*
+ * Feeding times. The RV-3028 alarm matches on hour and minute alone, so the
+ * scheduler re-arms it for the next of these every time one fires. RTC_INT is
+ * on GPIO15, driven open drain by the RV-3028 against a 4k7 pull-up.
+ */
+#define RTC_INT_GPIO_NUM 15
 
 /* MAX98357A I2S amplifier */
 #define AUDIO_BCLK_GPIO_NUM    16
@@ -51,14 +82,16 @@ static const char *TAG = "main";
 
 void app_main(void)
 {
-    adc_oneshot_unit_handle_t adc1_unit     = NULL;
-    i2c_master_bus_handle_t   i2c_bus       = NULL;
-    drv8871_handle_t          motor_handle  = NULL;
-    max98357a_handle_t        audio_handle  = NULL;
-    rv3028_handle_t           rtc_handle    = NULL;
-    ch224a_handle_t           pd_handle     = NULL;
-    drv5055_handle_t          hall_handle   = NULL;
-    vsense_handle_t           supply_handle = NULL;
+    adc_oneshot_unit_handle_t adc1_unit       = NULL;
+    i2c_master_bus_handle_t   i2c_bus         = NULL;
+    drv8871_handle_t          motor_handle    = NULL;
+    max98357a_handle_t        audio_handle    = NULL;
+    rv3028_handle_t           rtc_handle      = NULL;
+    ch224a_handle_t           pd_handle       = NULL;
+    drv5055_handle_t          hall_handle     = NULL;
+    vsense_handle_t           supply_handle   = NULL;
+    dispenser_handle_t        drum_handle     = NULL;
+    scheduler_handle_t        schedule_handle = NULL;
 
     drv8871_config_t motor_cfg = {
         .in1_gpio_num     = MOTOR_IN1_GPIO_NUM,
@@ -96,6 +129,37 @@ void app_main(void)
         .overvoltage_mv  = SUPPLY_OVERVOLTAGE_MV,
         .hysteresis_mv   = SUPPLY_RANGE_HYSTERESIS_MV,
     };
+    static const scheduler_slot_t dispense_slots[] = {
+        {.hour = 7, .minute = 0},
+        {.hour = 15, .minute = 0},
+        {.hour = 23, .minute = 0},
+    };
+    scheduler_config_t schedule_cfg = {
+        .int_gpio_num    = RTC_INT_GPIO_NUM,
+        .slots           = dispense_slots,
+        .slot_count      = sizeof(dispense_slots) / sizeof(dispense_slots[0]),
+        .task_stack_size = 0,
+        .task_priority   = 0,
+    };
+    dispenser_config_t drum_cfg = {
+        .direction        = DISPENSE_DIRECTION,
+        .travel_speed_pct = DISPENSE_SPEED_PCT,
+        .poll_interval_ms = DISPENSE_POLL_MS,
+        .timeout_ms       = DISPENSE_TIMEOUT_MS,
+        .brake_ms         = DISPENSE_BRAKE_MS,
+        .home_chime =
+            {
+                .melody       = HOME_MELODY,
+                .repeat_count = HOME_MELODY_TIMES,
+                .volume_pct   = MELODY_VOLUME_PCT,
+            },
+        .advance_chime =
+            {
+                .melody       = TREAT_MELODY,
+                .repeat_count = TREAT_MELODY_TIMES,
+                .volume_pct   = MELODY_VOLUME_PCT,
+            },
+    };
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port                     = -1, /* auto-select */
         .sda_io_num                   = I2C_SDA_GPIO_NUM,
@@ -128,6 +192,12 @@ void app_main(void)
     ESP_ERROR_CHECK(drv5055_init(&hall_cfg, &hall_handle));
     ESP_ERROR_CHECK(vsense_init(&supply_cfg, &supply_handle));
 
+    drum_cfg.motor_handle = motor_handle;
+    drum_cfg.hall_handle  = hall_handle;
+    drum_cfg.audio_handle = audio_handle;
+
+    ESP_ERROR_CHECK(dispenser_init(&drum_cfg, &drum_handle));
+
     esp_err_t err = rv3028_init(&rtc_cfg, &rtc_handle);
     if (err != ESP_OK)
     {
@@ -142,6 +212,24 @@ void app_main(void)
         pd_handle = NULL;
     }
 
-    ESP_ERROR_CHECK(
-        console_start(i2c_bus, motor_handle, audio_handle, rtc_handle, pd_handle, hall_handle, supply_handle));
+    /* The schedule needs the RTC; without it the dispenser is console driven only */
+    if (rtc_handle)
+    {
+        schedule_cfg.rtc_handle  = rtc_handle;
+        schedule_cfg.drum_handle = drum_handle;
+
+        err = scheduler_start(&schedule_cfg, &schedule_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Dispensing schedule unavailable (%s)", esp_err_to_name(err));
+            schedule_handle = NULL;
+        }
+    }
+    else
+    {
+        ESP_LOGW(TAG, "No RTC, running without a dispensing schedule");
+    }
+
+    ESP_ERROR_CHECK(console_start(i2c_bus, motor_handle, audio_handle, rtc_handle, pd_handle, hall_handle,
+                                  supply_handle, drum_handle, schedule_handle));
 }

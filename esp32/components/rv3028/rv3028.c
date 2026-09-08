@@ -18,17 +18,29 @@
 #define RV3028_REG_DATE          0x04
 #define RV3028_REG_MONTH         0x05
 #define RV3028_REG_YEAR          0x06
+#define RV3028_REG_MINUTES_ALARM 0x07
+#define RV3028_REG_HOURS_ALARM   0x08
+#define RV3028_REG_WEEKDAY_ALARM 0x09
 #define RV3028_REG_STATUS        0x0E
 #define RV3028_REG_CONTROL1      0x0F
+#define RV3028_REG_CONTROL2      0x10
 #define RV3028_REG_EE_COMMAND    0x27
 #define RV3028_REG_EEPROM_BACKUP 0x37
 
 /* Status register bit masks */
 #define RV3028_STATUS_PORF   0x01
+#define RV3028_STATUS_AF     0x04
 #define RV3028_STATUS_EEBUSY 0x80
 
 /* Control 1 register bit masks */
 #define RV3028_CONTROL1_EERD 0x08
+#define RV3028_CONTROL1_WADA 0x20
+
+/* Control 2 register bit masks */
+#define RV3028_CONTROL2_AIE 0x08
+
+/* Alarm registers ignore their field when the top bit is set */
+#define RV3028_ALARM_DISABLE_MATCH 0x80
 
 /* EE command register values */
 #define RV3028_EE_COMMAND_FIRST  0x00
@@ -221,6 +233,147 @@ esp_err_t rv3028_is_time_valid(rv3028_handle_t handle, bool *out_valid)
 
     *out_valid = (status & RV3028_STATUS_PORF) == 0;
     return ESP_OK;
+}
+
+/*
+ * Arming clears any pending match first: the INT pin is open drain and stays
+ * low for as long as the alarm flag is set, so a stale flag would leave the
+ * line asserted and the falling edge for the next alarm would never happen.
+ */
+esp_err_t rv3028_set_alarm(rv3028_handle_t handle, int hour, int minute)
+{
+    esp_err_t err;
+    uint8_t   regs[3];
+    uint8_t   control1;
+    uint8_t   control2;
+
+    if (!handle || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* AE_M and AE_H clear so minutes and hours are matched, AE_WD set to ignore the day */
+    regs[0] = rv3028_to_bcd(minute);
+    regs[1] = rv3028_to_bcd(hour);
+    regs[2] = RV3028_ALARM_DISABLE_MATCH;
+
+    err = rv3028_write_regs(handle, RV3028_REG_MINUTES_ALARM, regs, sizeof(regs));
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    /* WADA picks the date over the weekday; it is masked off either way, but leave it defined */
+    err = rv3028_read_regs(handle, RV3028_REG_CONTROL1, &control1, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    control1 &= ~RV3028_CONTROL1_WADA;
+    err = rv3028_write_regs(handle, RV3028_REG_CONTROL1, &control1, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = rv3028_clear_alarm_flag(handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = rv3028_read_regs(handle, RV3028_REG_CONTROL2, &control2, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    control2 |= RV3028_CONTROL2_AIE;
+    err = rv3028_write_regs(handle, RV3028_REG_CONTROL2, &control2, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Alarm armed for %02d:%02d", hour, minute);
+    return ESP_OK;
+}
+
+esp_err_t rv3028_disable_alarm(rv3028_handle_t handle)
+{
+    esp_err_t err;
+    uint8_t   control2;
+
+    if (!handle)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = rv3028_read_regs(handle, RV3028_REG_CONTROL2, &control2, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    control2 &= ~RV3028_CONTROL2_AIE;
+    err = rv3028_write_regs(handle, RV3028_REG_CONTROL2, &control2, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return rv3028_clear_alarm_flag(handle);
+}
+
+esp_err_t rv3028_get_alarm_flag(rv3028_handle_t handle, bool *out_triggered)
+{
+    esp_err_t err;
+    uint8_t   status;
+
+    if (!handle || !out_triggered)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = rv3028_read_regs(handle, RV3028_REG_STATUS, &status, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    *out_triggered = (status & RV3028_STATUS_AF) != 0;
+    return ESP_OK;
+}
+
+/*
+ * The status register holds several write-to-clear flags; read-modify-write so
+ * that clearing the alarm does not drop a flag another part of the driver cares
+ * about, such as the power-on reset flag behind rv3028_is_time_valid().
+ */
+esp_err_t rv3028_clear_alarm_flag(rv3028_handle_t handle)
+{
+    esp_err_t err;
+    uint8_t   status;
+
+    if (!handle)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = rv3028_read_regs(handle, RV3028_REG_STATUS, &status, 1);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    if ((status & RV3028_STATUS_AF) == 0)
+    {
+        return ESP_OK;
+    }
+
+    status &= ~RV3028_STATUS_AF;
+    return rv3028_write_regs(handle, RV3028_REG_STATUS, &status, 1);
 }
 
 static esp_err_t rv3028_read_regs(rv3028_ctx_t *ctx, uint8_t reg, uint8_t *data, size_t len)

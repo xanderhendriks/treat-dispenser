@@ -19,6 +19,8 @@ static rv3028_handle_t         s_rtc_handle;
 static ch224a_handle_t         s_pd_handle;
 static drv5055_handle_t        s_hall_handle;
 static vsense_handle_t         s_supply_handle;
+static dispenser_handle_t      s_drum_handle;
+static scheduler_handle_t      s_schedule_handle;
 static esp_console_repl_t     *s_repl;
 
 /* i2c_scan sweeps the 7-bit addresses that are not reserved by the standard */
@@ -98,6 +100,12 @@ typedef struct supply_range_args
     struct arg_end *end;
 } supply_range_args_t;
 
+typedef struct dispense_speed_args
+{
+    struct arg_int *value;
+    struct arg_end *end;
+} dispense_speed_args_t;
+
 static speed_args_t          s_speed_args;
 static direction_args_t      s_direction_args;
 static play_args_t           s_play_args;
@@ -109,6 +117,7 @@ static hall_threshold_args_t s_hall_threshold_args;
 
 static supply_calibrate_args_t s_supply_calibrate_args;
 static supply_range_args_t     s_supply_range_args;
+static dispense_speed_args_t   s_dispense_speed_args;
 
 static esp_err_t register_speed_command(void);
 static esp_err_t register_direction_command(void);
@@ -131,6 +140,10 @@ static esp_err_t register_hall_threshold_command(void);
 static esp_err_t register_supply_command(void);
 static esp_err_t register_supply_calibrate_command(void);
 static esp_err_t register_supply_range_command(void);
+static esp_err_t register_home_command(void);
+static esp_err_t register_next_command(void);
+static esp_err_t register_dispense_speed_command(void);
+static esp_err_t register_schedule_command(void);
 
 static int cmd_speed(int argc, char **argv);
 static int cmd_direction(int argc, char **argv);
@@ -153,29 +166,39 @@ static int cmd_hall_threshold(int argc, char **argv);
 static int cmd_supply(int argc, char **argv);
 static int cmd_supply_calibrate(int argc, char **argv);
 static int cmd_supply_range(int argc, char **argv);
+static int cmd_home(int argc, char **argv);
+static int cmd_next(int argc, char **argv);
+static int cmd_dispense_speed(int argc, char **argv);
+static int cmd_schedule(int argc, char **argv);
 
 static void print_hall_reading(const drv5055_reading_t *reading);
 static void print_supply_reading(const vsense_reading_t *reading);
+static void print_move_result(const dispenser_result_t *result);
+static int  report_move_error(const char *what, esp_err_t err);
 
 esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_handle, max98357a_handle_t audio_handle,
                         rv3028_handle_t rtc_handle, ch224a_handle_t pd_handle, drv5055_handle_t hall_handle,
-                        vsense_handle_t supply_handle)
+                        vsense_handle_t supply_handle, dispenser_handle_t drum_handle,
+                        scheduler_handle_t schedule_handle)
 {
     esp_err_t err;
 
-    /* rtc_handle and pd_handle may be NULL when those chips failed to initialize */
-    if (i2c_bus == NULL || motor_handle == NULL || audio_handle == NULL || hall_handle == NULL || supply_handle == NULL)
+    /* rtc_handle, pd_handle and schedule_handle may be NULL when the RTC or the PD chip is absent */
+    if (i2c_bus == NULL || motor_handle == NULL || audio_handle == NULL || hall_handle == NULL ||
+        supply_handle == NULL || drum_handle == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_i2c_bus       = i2c_bus;
-    s_motor_handle  = motor_handle;
-    s_audio_handle  = audio_handle;
-    s_rtc_handle    = rtc_handle;
-    s_pd_handle     = pd_handle;
-    s_hall_handle   = hall_handle;
-    s_supply_handle = supply_handle;
+    s_i2c_bus         = i2c_bus;
+    s_motor_handle    = motor_handle;
+    s_audio_handle    = audio_handle;
+    s_rtc_handle      = rtc_handle;
+    s_pd_handle       = pd_handle;
+    s_hall_handle     = hall_handle;
+    s_supply_handle   = supply_handle;
+    s_drum_handle     = drum_handle;
+    s_schedule_handle = schedule_handle;
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt                    = "treat_dispenser>";
@@ -336,6 +359,34 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register supply_range command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_home_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register home command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_next_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register next command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_dispense_speed_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register dispense_speed command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_schedule_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register schedule command (%s)", esp_err_to_name(err));
         return err;
     }
 
@@ -648,6 +699,58 @@ static esp_err_t register_supply_range_command(void)
     return esp_console_cmd_register(&cmd);
 }
 
+static esp_err_t register_home_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "home",
+        .help    = "Turn the drum until it parks on the home magnet (the reversed one, reading a negative field)",
+        .hint    = NULL,
+        .func    = &cmd_home,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_next_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "next",
+        .help    = "Turn the drum on to the next magnet, whatever its polarity",
+        .hint    = NULL,
+        .func    = &cmd_next,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_dispense_speed_command(void)
+{
+    s_dispense_speed_args.value = arg_int0(NULL, NULL, "<1-100>", "Motor speed used by home and next, in percent");
+    s_dispense_speed_args.end   = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "dispense_speed",
+        .help     = "Show or set the motor speed the home and next commands drive at",
+        .hint     = NULL,
+        .func     = &cmd_dispense_speed,
+        .argtable = &s_dispense_speed_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_schedule_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "schedule",
+        .help    = "Show the automatic dispensing times and the one the RTC alarm is armed for",
+        .hint    = NULL,
+        .func    = &cmd_schedule,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
 static int cmd_speed(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **) &s_speed_args);
@@ -825,6 +928,18 @@ static int cmd_time_set(int argc, char **argv)
     }
 
     printf("Time set to %04d-%02d-%02d %02d:%02d:%02d\n", year, month, day, hour, minute, second);
+
+    /* The armed alarm was picked against the old time, so it has to be recomputed */
+    if (s_schedule_handle)
+    {
+        err = scheduler_reschedule(s_schedule_handle);
+        if (err != ESP_OK)
+        {
+            printf("Failed to update the dispensing schedule (%s)\n", esp_err_to_name(err));
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -1349,5 +1464,137 @@ static int cmd_supply_range(int argc, char **argv)
     vsense_get_range(s_supply_handle, &undervoltage_mv, &overvoltage_mv, &hysteresis_mv);
     printf("Undervoltage %lu mV, overvoltage %lu mV, hysteresis %lu mV\n", (unsigned long) undervoltage_mv,
            (unsigned long) overvoltage_mv, (unsigned long) hysteresis_mv);
+    return 0;
+}
+
+static void print_move_result(const dispenser_result_t *result)
+{
+    int32_t magnitude = result->field_ut < 0 ? -result->field_ut : result->field_ut;
+
+    printf("Parked at %s%ld.%03ld mT after %lu ms", result->field_ut < 0 ? "-" : "", (long) (magnitude / 1000),
+           (long) (magnitude % 1000), (unsigned long) result->elapsed_ms);
+
+    if (result->magnets_passed > 0)
+    {
+        printf(", %lu magnet%s passed", (unsigned long) result->magnets_passed, result->magnets_passed == 1 ? "" : "s");
+    }
+
+    printf("\n");
+}
+
+static int report_move_error(const char *what, esp_err_t err)
+{
+    if (err == ESP_ERR_TIMEOUT)
+    {
+        printf("Timed out looking for a magnet, the drum may be jammed or the motor may be too slow\n");
+    }
+    else if (err == ESP_ERR_NOT_FOUND)
+    {
+        printf("Went past a full drum of magnets without finding a negative one, check the home magnet polarity\n");
+    }
+    else
+    {
+        printf("Failed to %s (%s)\n", what, esp_err_to_name(err));
+    }
+
+    return 1;
+}
+
+static int cmd_home(int argc, char **argv)
+{
+    dispenser_result_t result;
+
+    esp_err_t err = dispenser_home(s_drum_handle, &result);
+    if (err != ESP_OK)
+    {
+        return report_move_error("home the drum", err);
+    }
+
+    if (result.already_there)
+    {
+        printf("Already at home\n");
+        return 0;
+    }
+
+    print_move_result(&result);
+    return 0;
+}
+
+static int cmd_next(int argc, char **argv)
+{
+    dispenser_result_t result;
+
+    esp_err_t err = dispenser_advance(s_drum_handle, &result);
+    if (err != ESP_OK)
+    {
+        return report_move_error("advance the drum", err);
+    }
+
+    print_move_result(&result);
+    return 0;
+}
+
+static int cmd_dispense_speed(int argc, char **argv)
+{
+    uint32_t speed_pct;
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_dispense_speed_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_dispense_speed_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_dispense_speed_args.value->count > 0)
+    {
+        int speed = s_dispense_speed_args.value->ival[0];
+        if (speed < 1 || speed > 100)
+        {
+            printf("Speed must be between 1 and 100\n");
+            return 1;
+        }
+
+        esp_err_t err = dispenser_set_travel_speed(s_drum_handle, (uint32_t) speed);
+        if (err != ESP_OK)
+        {
+            printf("Failed to set the travel speed (%s)\n", esp_err_to_name(err));
+            return 1;
+        }
+    }
+
+    dispenser_get_travel_speed(s_drum_handle, &speed_pct);
+    printf("Travel speed: %lu%%\n", (unsigned long) speed_pct);
+    return 0;
+}
+
+static int cmd_schedule(int argc, char **argv)
+{
+    const scheduler_slot_t *slots      = NULL;
+    size_t                  slot_count = 0;
+    scheduler_slot_t        next;
+
+    if (s_schedule_handle == NULL)
+    {
+        printf("No dispensing schedule, the RTC is unavailable\n");
+        return 1;
+    }
+
+    scheduler_get_slots(s_schedule_handle, &slots, &slot_count);
+
+    printf("Dispensing at");
+    for (size_t i = 0; i < slot_count; i++)
+    {
+        printf("%s %02d:%02d", i == 0 ? "" : ",", slots[i].hour, slots[i].minute);
+    }
+    printf("\n");
+
+    esp_err_t err = scheduler_get_next_slot(s_schedule_handle, &next);
+    if (err != ESP_OK)
+    {
+        printf("Failed to read the armed alarm (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Alarm armed for %02d:%02d\n", next.hour, next.minute);
     return 0;
 }

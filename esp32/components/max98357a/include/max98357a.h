@@ -16,6 +16,7 @@ extern "C"
     typedef enum
     {
         MAX98357A_MELODY_FOR_THE_LONGEST_TIME = 0,
+        MAX98357A_MELODY_TADA                 = 1,
         MAX98357A_MELODY_COUNT,
     } max98357a_melody_t;
 

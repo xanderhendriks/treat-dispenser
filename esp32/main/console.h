@@ -1,12 +1,14 @@
 #pragma once
 
 #include "ch224a.h"
+#include "dispenser.h"
 #include "driver/i2c_master.h"
 #include "drv5055.h"
 #include "drv8871.h"
 #include "esp_err.h"
 #include "max98357a.h"
 #include "rv3028.h"
+#include "scheduler.h"
 #include "vsense.h"
 
 /**
@@ -19,8 +21,11 @@
  * @param pd_handle Initialized CH224A handle, NULL when the chip is absent.
  * @param hall_handle Initialized DRV5055 handle.
  * @param supply_handle Initialized +9V rail monitor handle.
+ * @param drum_handle Initialized dispenser motion handle.
+ * @param schedule_handle Dispensing schedule handle, NULL when the RTC is absent.
  * @return ESP_OK on success or an error from esp_console_* APIs.
  */
 esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_handle, max98357a_handle_t audio_handle,
                         rv3028_handle_t rtc_handle, ch224a_handle_t pd_handle, drv5055_handle_t hall_handle,
-                        vsense_handle_t supply_handle);
+                        vsense_handle_t supply_handle, dispenser_handle_t drum_handle,
+                        scheduler_handle_t schedule_handle);
