@@ -23,6 +23,27 @@ extern "C"
         uint32_t           volume_pct;
     } dispenser_chime_t;
 
+    /* Which magnet a move hunts for, and so which way the drum has to turn */
+    typedef enum
+    {
+        DISPENSER_MOVE_HOME = 0, /* the home magnet, turning the dispensing way */
+        DISPENSER_MOVE_ADVANCE,  /* the next magnet, dispensing a treat */
+        DISPENSER_MOVE_RETREAT,  /* the previous magnet, turning back and dispensing nothing */
+    } dispenser_move_t;
+
+/*
+ * Slots in the drum, numbered the way the drum turns when dispensing. Each slot
+ * carries one magnet; the pair on slots 0 and 1 sits at one height and the pair
+ * on slots 2 and 3 at another, and within each pair the two magnets face the
+ * sensor with opposite poles. That gives four distinct signed field levels, so a
+ * single Hall reading says which slot is at the opening.
+ */
+#define DISPENSER_SLOT_COUNT 4
+#define DISPENSER_SLOT_HOME  0
+
+    /* Returned by dispenser_get_slot() when the drum is parked between magnets */
+#define DISPENSER_SLOT_NONE (-1)
+
     typedef struct
     {
         drv8871_handle_t   motor_handle; /* initialized DRV8871 handle */
@@ -31,6 +52,7 @@ extern "C"
 
         dispenser_chime_t home_chime;    /* played when dispenser_home() reaches the home magnet */
         dispenser_chime_t advance_chime; /* played when dispenser_advance() reaches the next magnet */
+        dispenser_chime_t retreat_chime; /* played when dispenser_retreat() reaches the previous magnet */
 
         drv8871_direction_t direction;        /* direction the drum turns while dispensing */
         uint32_t            travel_speed_pct; /* motor speed used for moves, 0 selects 60 % */
@@ -101,6 +123,44 @@ extern "C"
     esp_err_t dispenser_advance(dispenser_handle_t handle, dispenser_result_t *out_result);
 
     /**
+     * Turn the drum back to the previous magnet, whatever its polarity.
+     *
+     * The mirror image of dispenser_advance(): the drum turns the opposite way
+     * and gives nothing out, which is what undoes a slot advanced by mistake.
+     * Always moves, exactly one position per call.
+     *
+     * Blocks until the magnet is found or the move times out, and always leaves
+     * the motor stopped. On success the configured retreat chime starts playing
+     * in the background.
+     *
+     * @param handle Dispenser handle.
+     * @param out_result Receives details of the move, may be NULL.
+     * @return ESP_OK on success, ESP_ERR_TIMEOUT when the previous magnet did
+     *         not arrive within the configured budget, or an error from the
+     *         motor or Hall driver.
+     */
+    esp_err_t dispenser_retreat(dispenser_handle_t handle, dispenser_result_t *out_result);
+
+    /**
+     * Make any of the three moves, with a chime of the caller's choosing.
+     *
+     * dispenser_home(), dispenser_advance() and dispenser_retreat() are this
+     * with the configured chime. Passing one here overrides that, which is how
+     * a caller that acknowledges a move some other way — the phone link showing
+     * it on screen, say — keeps the drum from bursting into song.
+     *
+     * @param handle Dispenser handle.
+     * @param move Which move to make.
+     * @param chime Chime to play on success, NULL for the configured one. A
+     *              chime with a repeat_count of 0 stays silent.
+     * @param out_result Receives details of the move, may be NULL.
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG for an unknown move, or the
+     *         errors the individual moves report.
+     */
+    esp_err_t dispenser_move(dispenser_handle_t handle, dispenser_move_t move, const dispenser_chime_t *chime,
+                             dispenser_result_t *out_result);
+
+    /**
      * Read whether the drum is currently parked on the home magnet.
      *
      * @param handle Dispenser handle.
@@ -122,6 +182,141 @@ extern "C"
      * Get the motor speed used for moves, in percent.
      */
     esp_err_t dispenser_get_travel_speed(dispenser_handle_t handle, uint32_t *out_speed_pct);
+
+    typedef struct
+    {
+        uint32_t revolutions; /* full turns averaged over, 0 selects 3 */
+        uint32_t speed_pct;   /* motor speed while turning, 0 selects the configured travel speed */
+
+        int32_t gate_ut;    /* field magnitude that opens a magnet pass, 0 selects 3000 uT */
+        int32_t release_ut; /* magnitude that closes it again, 0 selects half the gate */
+
+        bool dispensing_direction; /* turn the dispensing way; the default turns back so no treats fall out */
+        bool home_pair_is_weaker;  /* slots 0 and 1 sit further from the sensor than slots 2 and 3 */
+        bool recalibrate_zero;     /* capture a fresh zero-field reference before turning */
+        bool skip_save;            /* leave non-volatile storage alone, just report what was measured */
+    } dispenser_cal_config_t;
+
+    typedef struct
+    {
+        int32_t level_ut[DISPENSER_SLOT_COUNT];  /* averaged signed peak, indexed by slot */
+        int32_t spread_ut[DISPENSER_SLOT_COUNT]; /* peak-to-peak scatter across revolutions, per slot */
+
+        int32_t boundary_ut[DISPENSER_SLOT_COUNT - 1]; /* decision boundaries, ascending */
+        int32_t margin_ut;                             /* smallest gap between a level and its boundary */
+
+        int32_t  gate_ut;    /* magnitude below which no magnet is in front of the sensor */
+        int32_t  zero_mv;    /* zero-field reference the levels were measured against */
+        uint32_t peaks_seen; /* magnet passes captured */
+        bool     saved;      /* the map was written to non-volatile storage */
+    } dispenser_cal_result_t;
+
+    /**
+     * Learn the field level of every slot and store the resulting map.
+     *
+     * Turns the drum continuously for the configured number of revolutions,
+     * recording the signed peak field of each magnet as it goes by, then averages
+     * the passes belonging to each slot and places a decision boundary midway
+     * between neighbouring levels. On success the map is written to non-volatile
+     * storage and becomes active straight away, so a later boot only has to call
+     * dispenser_calibration_load().
+     *
+     * Which measured level belongs to which slot follows from the mounting: the
+     * two magnets sharing a height are on adjacent slots, so the run of two weak
+     * levels followed by two strong ones can only line up with the drum one way.
+     * home_pair_is_weaker says which of the two heights slots 0 and 1 are at, and
+     * is the one thing the routine cannot work out for itself.
+     *
+     * By default the drum turns the non-dispensing way so nothing falls out, but
+     * run it on an empty drum regardless: several full revolutions go past the
+     * opening.
+     *
+     * Blocks for the whole run and always leaves the motor stopped. Plays no
+     * chime.
+     *
+     * @param handle Dispenser handle.
+     * @param config Calibration settings, NULL for all defaults.
+     * @param out_result Receives the measured map, may be NULL.
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG for a bad setting,
+     *         ESP_ERR_TIMEOUT when a magnet did not arrive in time,
+     *         ESP_ERR_INVALID_RESPONSE when the captured passes do not add up to
+     *         a whole number of revolutions, ESP_ERR_NOT_FOUND when the two
+     *         magnets at the same height are not on adjacent slots,
+     *         ESP_ERR_INVALID_STATE when two levels are too close to tell apart,
+     *         or an error from the motor, Hall or NVS driver.
+     */
+    esp_err_t dispenser_calibrate(dispenser_handle_t handle, const dispenser_cal_config_t *config,
+                                  dispenser_cal_result_t *out_result);
+
+    /**
+     * Load the stored slot map and make it active.
+     *
+     * Called by dispenser_init(), so the map from the last calibration is already
+     * in place; call it again only to undo an uncommitted dispenser_calibrate()
+     * run. Also restores the zero-field reference the map was measured against,
+     * because the levels mean nothing without it.
+     *
+     * @param handle Dispenser handle.
+     * @return ESP_OK on success, ESP_ERR_NVS_NOT_FOUND when nothing has been
+     *         stored yet, ESP_ERR_INVALID_VERSION when the stored map came from
+     *         an incompatible build, or an error from the NVS driver.
+     */
+    esp_err_t dispenser_calibration_load(dispenser_handle_t handle);
+
+    /**
+     * Read back the active slot map without turning the drum.
+     *
+     * @param handle Dispenser handle.
+     * @param out_result Receives the map. spread_ut and peaks_seen are zero
+     *                   unless this handle ran the calibration itself.
+     * @return ESP_OK on success, ESP_ERR_INVALID_STATE when no map is active.
+     */
+    esp_err_t dispenser_calibration_get(dispenser_handle_t handle, dispenser_cal_result_t *out_result);
+
+    /**
+     * Forget the stored slot map, on this handle and in non-volatile storage.
+     *
+     * Homing falls back to treating the single negative magnet as home, which is
+     * the behaviour from before the slots were told apart by height.
+     *
+     * @param handle Dispenser handle.
+     * @return ESP_OK on success or an error from the NVS driver.
+     */
+    esp_err_t dispenser_calibration_erase(dispenser_handle_t handle);
+
+    /**
+     * Read whether a slot map is active.
+     */
+    bool dispenser_is_calibrated(dispenser_handle_t handle);
+
+    /**
+     * Read which slot is at the opening.
+     *
+     * Takes one Hall reading and matches it against the map. This is the whole
+     * point of calibrating: position comes from a single sample, with no homing
+     * run and no step counting.
+     *
+     * @param handle Dispenser handle.
+     * @param out_slot Receives the slot number, or DISPENSER_SLOT_NONE when the
+     *                 drum is parked between magnets.
+     * @return ESP_OK on success, ESP_ERR_INVALID_STATE when no map is active, or
+     *         an error from the Hall driver.
+     */
+    esp_err_t dispenser_get_slot(dispenser_handle_t handle, int *out_slot);
+
+    /**
+     * Match an already-measured field against the map.
+     *
+     * The arithmetic behind dispenser_get_slot(), split out so a caller that
+     * already has a reading — the field a dispenser_result_t reports, say — does
+     * not have to take another one.
+     *
+     * @param handle Dispenser handle.
+     * @param field_ut Signed flux density in microtesla.
+     * @param out_slot Receives the slot number, or DISPENSER_SLOT_NONE.
+     * @return ESP_OK on success or ESP_ERR_INVALID_STATE when no map is active.
+     */
+    esp_err_t dispenser_classify_field(dispenser_handle_t handle, int32_t field_ut, int *out_slot);
 
 #ifdef __cplusplus
 }

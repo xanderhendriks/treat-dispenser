@@ -21,6 +21,7 @@ static drv5055_handle_t        s_hall_handle;
 static vsense_handle_t         s_supply_handle;
 static dispenser_handle_t      s_drum_handle;
 static scheduler_handle_t      s_schedule_handle;
+static ble_remote_handle_t     s_ble_handle;
 static esp_console_repl_t     *s_repl;
 
 /* i2c_scan sweeps the 7-bit addresses that are not reserved by the standard */
@@ -142,8 +143,12 @@ static esp_err_t register_supply_calibrate_command(void);
 static esp_err_t register_supply_range_command(void);
 static esp_err_t register_home_command(void);
 static esp_err_t register_next_command(void);
+static esp_err_t register_prev_command(void);
 static esp_err_t register_dispense_speed_command(void);
 static esp_err_t register_schedule_command(void);
+static esp_err_t register_ble_command(void);
+static esp_err_t register_ble_pair_command(void);
+static esp_err_t register_ble_forget_command(void);
 
 static int cmd_speed(int argc, char **argv);
 static int cmd_direction(int argc, char **argv);
@@ -168,8 +173,12 @@ static int cmd_supply_calibrate(int argc, char **argv);
 static int cmd_supply_range(int argc, char **argv);
 static int cmd_home(int argc, char **argv);
 static int cmd_next(int argc, char **argv);
+static int cmd_prev(int argc, char **argv);
 static int cmd_dispense_speed(int argc, char **argv);
 static int cmd_schedule(int argc, char **argv);
+static int cmd_ble(int argc, char **argv);
+static int cmd_ble_pair(int argc, char **argv);
+static int cmd_ble_forget(int argc, char **argv);
 
 static void print_hall_reading(const drv5055_reading_t *reading);
 static void print_supply_reading(const vsense_reading_t *reading);
@@ -179,11 +188,11 @@ static int  report_move_error(const char *what, esp_err_t err);
 esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_handle, max98357a_handle_t audio_handle,
                         rv3028_handle_t rtc_handle, ch224a_handle_t pd_handle, drv5055_handle_t hall_handle,
                         vsense_handle_t supply_handle, dispenser_handle_t drum_handle,
-                        scheduler_handle_t schedule_handle)
+                        scheduler_handle_t schedule_handle, ble_remote_handle_t ble_handle)
 {
     esp_err_t err;
 
-    /* rtc_handle, pd_handle and schedule_handle may be NULL when the RTC or the PD chip is absent */
+    /* rtc_handle, pd_handle, schedule_handle and ble_handle may be NULL when that part is unavailable */
     if (i2c_bus == NULL || motor_handle == NULL || audio_handle == NULL || hall_handle == NULL ||
         supply_handle == NULL || drum_handle == NULL)
     {
@@ -199,6 +208,7 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     s_supply_handle   = supply_handle;
     s_drum_handle     = drum_handle;
     s_schedule_handle = schedule_handle;
+    s_ble_handle      = ble_handle;
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt                    = "treat_dispenser>";
@@ -376,6 +386,13 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
         return err;
     }
 
+    err = register_prev_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register prev command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
     err = register_dispense_speed_command();
     if (err != ESP_OK)
     {
@@ -387,6 +404,27 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register schedule command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_ble_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register ble command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_ble_pair_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register ble_pair command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_ble_forget_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register ble_forget command (%s)", esp_err_to_name(err));
         return err;
     }
 
@@ -723,6 +761,18 @@ static esp_err_t register_next_command(void)
     return esp_console_cmd_register(&cmd);
 }
 
+static esp_err_t register_prev_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "prev",
+        .help    = "Turn the drum back to the previous magnet, dispensing nothing",
+        .hint    = NULL,
+        .func    = &cmd_prev,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
 static esp_err_t register_dispense_speed_command(void)
 {
     s_dispense_speed_args.value = arg_int0(NULL, NULL, "<1-100>", "Motor speed used by home and next, in percent");
@@ -746,6 +796,42 @@ static esp_err_t register_schedule_command(void)
         .help    = "Show the automatic dispensing times and the one the RTC alarm is armed for",
         .hint    = NULL,
         .func    = &cmd_schedule,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_ble_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ble",
+        .help    = "Show the state of the phone link and the pairing window",
+        .hint    = NULL,
+        .func    = &cmd_ble,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_ble_pair_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ble_pair",
+        .help    = "Re-open the pairing window so another phone can bond without a reset",
+        .hint    = NULL,
+        .func    = &cmd_ble_pair,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_ble_forget_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ble_forget",
+        .help    = "Delete every stored bond, so paired phones have to forget the dispenser and pair again",
+        .hint    = NULL,
+        .func    = &cmd_ble_forget,
     };
 
     return esp_console_cmd_register(&cmd);
@@ -1534,6 +1620,20 @@ static int cmd_next(int argc, char **argv)
     return 0;
 }
 
+static int cmd_prev(int argc, char **argv)
+{
+    dispenser_result_t result;
+
+    esp_err_t err = dispenser_retreat(s_drum_handle, &result);
+    if (err != ESP_OK)
+    {
+        return report_move_error("turn the drum back", err);
+    }
+
+    print_move_result(&result);
+    return 0;
+}
+
 static int cmd_dispense_speed(int argc, char **argv)
 {
     uint32_t speed_pct;
@@ -1596,5 +1696,81 @@ static int cmd_schedule(int argc, char **argv)
     }
 
     printf("Alarm armed for %02d:%02d\n", next.hour, next.minute);
+    return 0;
+}
+
+static int cmd_ble(int argc, char **argv)
+{
+    ble_remote_status_t status;
+
+    if (s_ble_handle == NULL)
+    {
+        printf("No phone link, the BLE peripheral failed to start\n");
+        return 1;
+    }
+
+    esp_err_t err = ble_remote_get_status(s_ble_handle, &status);
+    if (err != ESP_OK)
+    {
+        printf("Failed to read the link state (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Link: %s", status.connected ? "connected" : "advertising");
+    if (status.connected)
+    {
+        printf(", %s", status.encrypted ? "encrypted" : "not encrypted yet");
+    }
+    printf("\n");
+
+    if (status.pairing_open)
+    {
+        printf("Pairing: open, %lu s left\n", (unsigned long) (status.pairing_left_ms / 1000));
+    }
+    else
+    {
+        printf("Pairing: shut, run ble_pair to re-open it\n");
+    }
+
+    printf("Bonds: %lu\n", (unsigned long) status.bond_count);
+    printf("Dispenser: %s\n", status.busy ? "busy" : "idle");
+    return 0;
+}
+
+static int cmd_ble_pair(int argc, char **argv)
+{
+    if (s_ble_handle == NULL)
+    {
+        printf("No phone link, the BLE peripheral failed to start\n");
+        return 1;
+    }
+
+    esp_err_t err = ble_remote_open_pairing(s_ble_handle);
+    if (err != ESP_OK)
+    {
+        printf("Failed to open the pairing window (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Pairing window open\n");
+    return 0;
+}
+
+static int cmd_ble_forget(int argc, char **argv)
+{
+    if (s_ble_handle == NULL)
+    {
+        printf("No phone link, the BLE peripheral failed to start\n");
+        return 1;
+    }
+
+    esp_err_t err = ble_remote_forget_bonds(s_ble_handle);
+    if (err != ESP_OK)
+    {
+        printf("Failed to clear the bonds (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("All bonds deleted, forget the dispenser on the phone as well\n");
     return 0;
 }

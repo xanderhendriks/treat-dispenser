@@ -3,3 +3,34 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Radio: BLE only. ESP_WIFI_ENABLED is a hidden symbol that tracks what the
+# silicon can do, so the way to keep WiFi out of the way is to never bring the
+# stack up (nothing calls esp_wifi_init) and to leave the software coexistence
+# arbiter off, which hands the whole radio to BLE.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="Treat Dispenser"
+
+# LE Secure Connections only, and bonds kept in NVS so a paired phone
+# reconnects without the pairing window having to be open again.
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_SM_LEGACY=n
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# Room for eight phones rather than the three the default allows. Only one is
+# connected at a time; the rest just keep their keys. A ninth pairing evicts the
+# oldest bond, that phone having to pair again to come back.
+CONFIG_BT_NIMBLE_MAX_BONDS=8
+
+# Headroom for a future OTA over BLE. Data length extension needs no option on
+# this controller, it is always offered and negotiated per connection.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY=y

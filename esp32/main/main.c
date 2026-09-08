@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#include "ble_remote.h"
 #include "ch224a.h"
 #include "console.h"
 #include "dispenser.h"
@@ -8,6 +9,7 @@
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "max98357a.h"
+#include "nvs_flash.h"
 #include "rv3028.h"
 #include "scheduler.h"
 #include "vsense.h"
@@ -31,12 +33,18 @@
 /*
  * A tada marks arriving at the home position, and the Billy Joel hook plays
  * twice once a treat has been dispensed.
+ *
+ * The tada doubles as the short acknowledgement: it is what a move backwards
+ * plays, having dispensed nothing worth singing about, and what any move driven
+ * from the phone plays, the app already showing on screen that it finished.
  */
 #define HOME_MELODY        MAX98357A_MELODY_TADA
 #define HOME_MELODY_TIMES  1
 #define TREAT_MELODY       MAX98357A_MELODY_FOR_THE_LONGEST_TIME
 #define TREAT_MELODY_TIMES 2
-#define MELODY_VOLUME_PCT  60
+#define SHORT_MELODY       MAX98357A_MELODY_TADA
+#define SHORT_MELODY_TIMES 1
+#define MELODY_VOLUME_PCT  75
 
 /*
  * Feeding times. The RV-3028 alarm matches on hour and minute alone, so the
@@ -78,6 +86,16 @@
  */
 #define PD_MAX_VOLTAGE CH224A_VOLTAGE_9V
 
+/*
+ * Phone link. The ESP32-S3 has no Bluetooth Classic radio, so this is BLE
+ * only; WiFi is never brought up and the coexistence arbiter is off, which
+ * leaves the whole radio to BLE. New phones may only pair during the first
+ * minute after a reset, after which the dispenser talks to bonded phones
+ * alone. The console ble_pair command re-opens the window.
+ */
+#define BLE_DEVICE_NAME       "Treat Dispenser"
+#define BLE_PAIRING_WINDOW_MS 60000
+
 static const char *TAG = "main";
 
 void app_main(void)
@@ -92,6 +110,7 @@ void app_main(void)
     vsense_handle_t           supply_handle   = NULL;
     dispenser_handle_t        drum_handle     = NULL;
     scheduler_handle_t        schedule_handle = NULL;
+    ble_remote_handle_t       ble_handle      = NULL;
 
     drv8871_config_t motor_cfg = {
         .in1_gpio_num     = MOTOR_IN1_GPIO_NUM,
@@ -159,6 +178,12 @@ void app_main(void)
                 .repeat_count = TREAT_MELODY_TIMES,
                 .volume_pct   = MELODY_VOLUME_PCT,
             },
+        .retreat_chime =
+            {
+                .melody       = SHORT_MELODY,
+                .repeat_count = SHORT_MELODY_TIMES,
+                .volume_pct   = MELODY_VOLUME_PCT,
+            },
     };
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port                     = -1, /* auto-select */
@@ -176,8 +201,29 @@ void app_main(void)
         .i2c_clock_speed_hz = 0,
         .max_voltage        = PD_MAX_VOLTAGE,
     };
+    ble_remote_config_t ble_cfg = {
+        .device_name       = BLE_DEVICE_NAME,
+        .pairing_window_ms = BLE_PAIRING_WINDOW_MS,
+        .remote_chime =
+            {
+                .melody       = SHORT_MELODY,
+                .repeat_count = SHORT_MELODY_TIMES,
+                .volume_pct   = MELODY_VOLUME_PCT,
+            },
+        .task_stack_size = 0,
+        .task_priority   = 0,
+    };
 
     ESP_LOGI(TAG, "Treat dispenser %s", esp_app_get_description()->version);
+
+    /* NVS holds the BLE bonds, so a fresh or upgraded partition is worth wiping rather than failing on */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
 
     ESP_ERROR_CHECK(drv8871_init(&motor_cfg, &motor_handle));
     ESP_ERROR_CHECK(max98357a_init(&audio_cfg, &audio_handle));
@@ -230,6 +276,17 @@ void app_main(void)
         ESP_LOGW(TAG, "No RTC, running without a dispensing schedule");
     }
 
+    ble_cfg.drum_handle     = drum_handle;
+    ble_cfg.rtc_handle      = rtc_handle;
+    ble_cfg.schedule_handle = schedule_handle;
+
+    err = ble_remote_start(&ble_cfg, &ble_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "BLE unavailable (%s), the dispenser is console driven only", esp_err_to_name(err));
+        ble_handle = NULL;
+    }
+
     ESP_ERROR_CHECK(console_start(i2c_bus, motor_handle, audio_handle, rtc_handle, pd_handle, hall_handle,
-                                  supply_handle, drum_handle, schedule_handle));
+                                  supply_handle, drum_handle, schedule_handle, ble_handle));
 }

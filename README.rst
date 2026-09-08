@@ -117,6 +117,66 @@ The schedule is computed from the RTC, so ``time_set`` re-arms the alarm for
 whatever the next feeding time is under the new clock. Without a working RTC the
 firmware still runs, but only ``home`` and ``next`` from the console.
 
+Phone link
+----------
+
+The dispenser is driven from an Android phone over BLE; the app lives in
+``app-treat-dispenser``. The ESP32-S3 has no Bluetooth Classic radio, so BLE
+GATT is the only option, and NimBLE is used rather than Bluedroid because it
+costs about half the flash and RAM for a peripheral this small.
+
+WiFi is never brought up — nothing calls ``esp_wifi_init`` — and
+``CONFIG_ESP_COEX_SW_COEXIST_ENABLE`` is off, which hands the whole radio to
+BLE. ``CONFIG_ESP_WIFI_ENABLED`` cannot be turned off in ``sdkconfig``: it is a
+hidden symbol that only tracks what the silicon can do.
+
+One custom service carries two characteristics:
+
+- command, write only, one byte: ``0x01`` runs ``home``, ``0x02`` runs ``next``
+- status, read and notify, four bytes: state (0 idle, 1 busy), the last command,
+  how it ended (1 ok, 2 timeout, 3 home magnet not found, 4 failed) and whether
+  the drum is parked on the home magnet
+
+  ==========  ======================================
+  service     ffc50e4e-afd5-4edd-86a1-b41c94120001
+  command     ffc50e4e-afd5-4edd-86a1-b41c94120002
+  status      ffc50e4e-afd5-4edd-86a1-b41c94120003
+  ==========  ======================================
+
+A move takes seconds, so a write is acknowledged immediately and carried out by
+a worker task; the app watches the status notification to see it finish.
+
+Pairing
+~~~~~~~
+
+Both characteristics require an encrypted link, so an unpaired phone can find
+the dispenser and discover the service but cannot turn the drum. Pairing uses
+LE Secure Connections with Just Works, the board having neither a display nor a
+keypad to show a passkey on.
+
+Just Works can be intercepted, but only during the pairing exchange itself, so
+that exchange is kept to a **60 second window from start-up**. After the window
+shuts, a phone that is not already bonded is disconnected as soon as it
+connects, and a request to pair again is ignored. Bonds live in NVS, so a paired
+phone reconnects silently for as long as it is bonded, whatever the window is
+doing.
+
+To adopt another phone, either reset the board or run ``ble_pair`` on the
+console. ``ble_forget`` deletes every bond; the phone keeps its own half, so it
+has to forget the dispenser in the Android Bluetooth settings before it can pair
+again.
+
+Over the air updates
+~~~~~~~~~~~~~~~~~~~~
+
+The partition table already carries two 8 MB OTA slots, and nothing yet writes
+to them. Over BLE the transfer is limited by the link rather than the flash:
+with the 2M PHY, data length extension, a 517 byte ATT MTU, a 15 ms connection
+interval and write-without-response, 20-60 kB/s is what a phone actually
+manages, so the current 690 kB image would take well under a minute. Using
+write-with-response for the payload drops that to one packet per connection
+event, which turns the same transfer into minutes; that is the mistake to avoid.
+
 Serial console
 --------------
 
@@ -148,4 +208,7 @@ The firmware starts a console REPL on UART0. Available commands:
   ``next`` drive at
 - ``schedule`` — show the automatic dispensing times and the one the RTC
   alarm is armed for
+- ``ble`` — show the state of the phone link and the pairing window
+- ``ble_pair`` — re-open the pairing window so another phone can bond
+- ``ble_forget`` — delete every stored bond
 - ``help`` — list all commands

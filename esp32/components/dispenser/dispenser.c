@@ -28,6 +28,7 @@ typedef struct dispenser_t
 
     dispenser_chime_t home_chime;
     dispenser_chime_t advance_chime;
+    dispenser_chime_t retreat_chime;
 
     drv8871_direction_t direction;
     uint32_t            speed_pct;
@@ -38,9 +39,13 @@ typedef struct dispenser_t
 
 static const char *TAG = "dispenser";
 
-static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, bool home_only, dispenser_result_t *out_result);
+static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, dispenser_move_t move, dispenser_result_t *out_result);
 static void      dispenser_play_chime(dispenser_ctx_t *ctx, const dispenser_chime_t *chime);
-static esp_err_t dispenser_start_motor(dispenser_ctx_t *ctx);
+
+static const dispenser_chime_t *dispenser_move_chime(const dispenser_ctx_t *ctx, dispenser_move_t move);
+static drv8871_direction_t      dispenser_move_direction(const dispenser_ctx_t *ctx, dispenser_move_t move);
+
+static esp_err_t dispenser_start_motor(dispenser_ctx_t *ctx, dispenser_move_t move);
 static esp_err_t dispenser_stop_motor(dispenser_ctx_t *ctx, bool brake);
 static bool      dispenser_is_home_field(int32_t field_ut);
 static bool      dispenser_within_magnet(dispenser_ctx_t *ctx, int32_t field_ut);
@@ -76,6 +81,7 @@ esp_err_t dispenser_init(const dispenser_config_t *config, dispenser_handle_t *o
     ctx->audio            = config->audio_handle;
     ctx->home_chime       = config->home_chime;
     ctx->advance_chime    = config->advance_chime;
+    ctx->retreat_chime    = config->retreat_chime;
     ctx->direction        = config->direction;
     ctx->speed_pct        = config->travel_speed_pct ? config->travel_speed_pct : DISPENSER_DEFAULT_SPEED_PCT;
     ctx->poll_interval_ms = config->poll_interval_ms ? config->poll_interval_ms : DISPENSER_DEFAULT_POLL_MS;
@@ -92,23 +98,21 @@ esp_err_t dispenser_init(const dispenser_config_t *config, dispenser_handle_t *o
 
 esp_err_t dispenser_home(dispenser_handle_t handle, dispenser_result_t *out_result)
 {
-    esp_err_t err;
-
-    if (!handle)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = dispenser_seek(handle, true, out_result);
-    if (err == ESP_OK)
-    {
-        dispenser_play_chime(handle, &handle->home_chime);
-    }
-
-    return err;
+    return dispenser_move(handle, DISPENSER_MOVE_HOME, NULL, out_result);
 }
 
 esp_err_t dispenser_advance(dispenser_handle_t handle, dispenser_result_t *out_result)
+{
+    return dispenser_move(handle, DISPENSER_MOVE_ADVANCE, NULL, out_result);
+}
+
+esp_err_t dispenser_retreat(dispenser_handle_t handle, dispenser_result_t *out_result)
+{
+    return dispenser_move(handle, DISPENSER_MOVE_RETREAT, NULL, out_result);
+}
+
+esp_err_t dispenser_move(dispenser_handle_t handle, dispenser_move_t move, const dispenser_chime_t *chime,
+                         dispenser_result_t *out_result)
 {
     esp_err_t err;
 
@@ -117,10 +121,15 @@ esp_err_t dispenser_advance(dispenser_handle_t handle, dispenser_result_t *out_r
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = dispenser_seek(handle, false, out_result);
+    if (move != DISPENSER_MOVE_HOME && move != DISPENSER_MOVE_ADVANCE && move != DISPENSER_MOVE_RETREAT)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = dispenser_seek(handle, move, out_result);
     if (err == ESP_OK)
     {
-        dispenser_play_chime(handle, &handle->advance_chime);
+        dispenser_play_chime(handle, chime ? chime : dispenser_move_chime(handle, move));
     }
 
     return err;
@@ -189,6 +198,36 @@ static void dispenser_play_chime(dispenser_ctx_t *ctx, const dispenser_chime_t *
     }
 }
 
+static const dispenser_chime_t *dispenser_move_chime(const dispenser_ctx_t *ctx, dispenser_move_t move)
+{
+    switch (move)
+    {
+        case DISPENSER_MOVE_HOME:
+            return &ctx->home_chime;
+
+        case DISPENSER_MOVE_RETREAT:
+            return &ctx->retreat_chime;
+
+        default:
+            return &ctx->advance_chime;
+    }
+}
+
+/*
+ * Retreating is the configured dispensing direction run backwards; the drum has
+ * no separate reverse speed or timeout because a magnet-to-magnet hop costs the
+ * same either way.
+ */
+static drv8871_direction_t dispenser_move_direction(const dispenser_ctx_t *ctx, dispenser_move_t move)
+{
+    if (move != DISPENSER_MOVE_RETREAT)
+    {
+        return ctx->direction;
+    }
+
+    return ctx->direction == DRV8871_DIRECTION_FORWARD ? DRV8871_DIRECTION_REVERSE : DRV8871_DIRECTION_FORWARD;
+}
+
 /*
  * The home magnet faces the sensor with the opposite pole to the others, so it
  * is the only one that pushes the DRV5055 output below its zero-field
@@ -221,19 +260,22 @@ static bool dispenser_within_magnet(dispenser_ctx_t *ctx, int32_t field_ut)
 }
 
 /*
- * Both moves are the same hunt: drive off whatever magnet the drum is parked
- * on, then stop on the first magnet that satisfies the caller. Detection rides
- * on the hysteresis the DRV5055 driver already applies, so a magnet counts once
- * on the way in and only counts again after the field has fallen away.
+ * All three moves are the same hunt: drive off whatever magnet the drum is
+ * parked on, then stop on the first magnet that satisfies the caller. Which way
+ * the drum turns is the only difference between advancing and retreating, the
+ * magnet the hunt settles on being whichever one comes past first. Detection
+ * rides on the hysteresis the DRV5055 driver already applies, so a magnet counts
+ * once on the way in and only counts again after the field has fallen away.
  *
  * The timeout is a budget per hop rather than for the whole move, so homing
  * past several magnets does not have to outrun a single deadline.
  */
-static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, bool home_only, dispenser_result_t *out_result)
+static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, dispenser_move_t move, dispenser_result_t *out_result)
 {
     esp_err_t          err;
     drv5055_reading_t  reading;
-    dispenser_result_t result = {0};
+    dispenser_result_t result    = {0};
+    const bool         home_only = move == DISPENSER_MOVE_HOME;
     bool               clear_first;
     TickType_t         start;
     TickType_t         deadline;
@@ -261,7 +303,7 @@ static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, bool home_only, dispenser_
 
     clear_first = reading.magnet_present || dispenser_within_magnet(ctx, reading.field_ut);
 
-    err = dispenser_start_motor(ctx);
+    err = dispenser_start_motor(ctx, move);
     if (err != ESP_OK)
     {
         return err;
@@ -346,9 +388,9 @@ static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, bool home_only, dispenser_
     return ESP_OK;
 }
 
-static esp_err_t dispenser_start_motor(dispenser_ctx_t *ctx)
+static esp_err_t dispenser_start_motor(dispenser_ctx_t *ctx, dispenser_move_t move)
 {
-    esp_err_t err = drv8871_set_direction(ctx->motor, ctx->direction);
+    esp_err_t err = drv8871_set_direction(ctx->motor, dispenser_move_direction(ctx, move));
     if (err != ESP_OK)
     {
         return err;

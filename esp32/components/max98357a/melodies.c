@@ -21,6 +21,11 @@
  * rhythm verified against the published sheet music and a MIDI transcription:
  * "Whoa oh oh oh" = Eb D Eb C, "for the long-est time" = D C D C Bb, and the
  * final "time" resolves up to Eb.
+ *
+ * The closing note is held for two beats rather than the three the sheet music
+ * gives it, which squares the last bar off at four beats like every other one.
+ * The hook is played back to back to mark a dispensed treat, and an odd bar at
+ * the seam makes each repeat come in off the beat.
  */
 static const melody_note_t s_for_the_longest_time_notes[] = {
     {NOTE_DS5, HALF},           /* Whoa    */
@@ -42,7 +47,7 @@ static const melody_note_t s_for_the_longest_time_notes[] = {
     {NOTE_C5, EIGHTH},          /* the     */
     {NOTE_D5, EIGHTH},          /* long    */
     {NOTE_C5, EIGHTH},          /* est     */
-    {NOTE_DS5, HALF + QUARTER}, /* time    */
+    {NOTE_DS5, HALF},           /* time    */
     {0, HALF},                  /* (rest)  */
 };
 
