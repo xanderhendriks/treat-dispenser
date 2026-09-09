@@ -9,7 +9,19 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "melodies.h"
 #include "sdkconfig.h"
+
+/*
+ * Moves driven from the console are acknowledged the same way as those driven
+ * from the phone: a short tada rather than the full treat tune, the printed
+ * result already saying the move finished.
+ */
+static const dispenser_chime_t s_manual_chime = {
+    .melody       = SHORT_MELODY,
+    .repeat_count = SHORT_MELODY_TIMES,
+    .volume_pct   = MELODY_VOLUME_PCT,
+};
 
 static const char             *TAG = "console";
 static i2c_master_bus_handle_t s_i2c_bus;
@@ -107,6 +119,24 @@ typedef struct dispense_speed_args
     struct arg_end *end;
 } dispense_speed_args_t;
 
+typedef struct slot_args
+{
+    struct arg_int *number;
+    struct arg_end *end;
+} slot_args_t;
+
+typedef struct drum_calibrate_args
+{
+    struct arg_int *revolutions;
+    struct arg_int *speed;
+    struct arg_int *gate;
+    struct arg_lit *forward;
+    struct arg_lit *home_weak;
+    struct arg_lit *zero;
+    struct arg_lit *dry_run;
+    struct arg_end *end;
+} drum_calibrate_args_t;
+
 static speed_args_t          s_speed_args;
 static direction_args_t      s_direction_args;
 static play_args_t           s_play_args;
@@ -119,6 +149,8 @@ static hall_threshold_args_t s_hall_threshold_args;
 static supply_calibrate_args_t s_supply_calibrate_args;
 static supply_range_args_t     s_supply_range_args;
 static dispense_speed_args_t   s_dispense_speed_args;
+static drum_calibrate_args_t   s_drum_calibrate_args;
+static slot_args_t             s_slot_args;
 
 static esp_err_t register_speed_command(void);
 static esp_err_t register_direction_command(void);
@@ -149,6 +181,12 @@ static esp_err_t register_schedule_command(void);
 static esp_err_t register_ble_command(void);
 static esp_err_t register_ble_pair_command(void);
 static esp_err_t register_ble_forget_command(void);
+static esp_err_t register_drum_calibrate_command(void);
+static esp_err_t register_drum_map_command(void);
+static esp_err_t register_drum_slot_command(void);
+static esp_err_t register_drum_forget_command(void);
+static esp_err_t register_slot_command(void);
+static esp_err_t register_locate_command(void);
 
 static int cmd_speed(int argc, char **argv);
 static int cmd_direction(int argc, char **argv);
@@ -179,11 +217,19 @@ static int cmd_schedule(int argc, char **argv);
 static int cmd_ble(int argc, char **argv);
 static int cmd_ble_pair(int argc, char **argv);
 static int cmd_ble_forget(int argc, char **argv);
+static int cmd_drum_calibrate(int argc, char **argv);
+static int cmd_drum_map(int argc, char **argv);
+static int cmd_drum_slot(int argc, char **argv);
+static int cmd_drum_forget(int argc, char **argv);
+static int cmd_slot(int argc, char **argv);
+static int cmd_locate(int argc, char **argv);
 
 static void print_hall_reading(const drv5055_reading_t *reading);
 static void print_supply_reading(const vsense_reading_t *reading);
 static void print_move_result(const dispenser_result_t *result);
+static void print_field_mt(int32_t field_ut);
 static int  report_move_error(const char *what, esp_err_t err);
+static void print_calibration(const dispenser_cal_result_t *result);
 
 esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_handle, max98357a_handle_t audio_handle,
                         rv3028_handle_t rtc_handle, ch224a_handle_t pd_handle, drv5055_handle_t hall_handle,
@@ -425,6 +471,48 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register ble_forget command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_drum_calibrate_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register drum_calibrate command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_drum_map_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register drum_map command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_drum_slot_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register drum_slot command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_drum_forget_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register drum_forget command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_slot_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register slot command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_locate_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register locate command (%s)", esp_err_to_name(err));
         return err;
     }
 
@@ -1555,10 +1643,20 @@ static int cmd_supply_range(int argc, char **argv)
 
 static void print_move_result(const dispenser_result_t *result)
 {
-    int32_t magnitude = result->field_ut < 0 ? -result->field_ut : result->field_ut;
+    if (result->slot == DISPENSER_SLOT_NONE)
+    {
+        printf("Parked on an unmapped magnet");
+    }
+    else
+    {
+        printf("Parked on slot %d%s", result->slot, result->slot == DISPENSER_SLOT_HOME ? " (home)" : "");
+    }
 
-    printf("Parked at %s%ld.%03ld mT after %lu ms", result->field_ut < 0 ? "-" : "", (long) (magnitude / 1000),
-           (long) (magnitude % 1000), (unsigned long) result->elapsed_ms);
+    printf(", peak ");
+    print_field_mt(result->peak_ut);
+    printf(", resting ");
+    print_field_mt(result->field_ut);
+    printf(", after %lu ms", (unsigned long) result->elapsed_ms);
 
     if (result->magnets_passed > 0)
     {
@@ -1566,6 +1664,13 @@ static void print_move_result(const dispenser_result_t *result)
     }
 
     printf("\n");
+}
+
+static void print_field_mt(int32_t field_ut)
+{
+    int32_t magnitude = field_ut < 0 ? -field_ut : field_ut;
+
+    printf("%s%ld.%03ld mT", field_ut < 0 ? "-" : "", (long) (magnitude / 1000), (long) (magnitude % 1000));
 }
 
 static int report_move_error(const char *what, esp_err_t err)
@@ -1610,7 +1715,7 @@ static int cmd_next(int argc, char **argv)
 {
     dispenser_result_t result;
 
-    esp_err_t err = dispenser_advance(s_drum_handle, &result);
+    esp_err_t err = dispenser_move(s_drum_handle, DISPENSER_MOVE_ADVANCE, &s_manual_chime, &result);
     if (err != ESP_OK)
     {
         return report_move_error("advance the drum", err);
@@ -1624,7 +1729,7 @@ static int cmd_prev(int argc, char **argv)
 {
     dispenser_result_t result;
 
-    esp_err_t err = dispenser_retreat(s_drum_handle, &result);
+    esp_err_t err = dispenser_move(s_drum_handle, DISPENSER_MOVE_RETREAT, &s_manual_chime, &result);
     if (err != ESP_OK)
     {
         return report_move_error("turn the drum back", err);
@@ -1773,4 +1878,319 @@ static int cmd_ble_forget(int argc, char **argv)
 
     printf("All bonds deleted, forget the dispenser on the phone as well\n");
     return 0;
+}
+
+static esp_err_t register_drum_calibrate_command(void)
+{
+    s_drum_calibrate_args.revolutions = arg_int0("r", "revolutions", "<n>", "Full turns to average over (default 3)");
+    s_drum_calibrate_args.speed       = arg_int0("s", "speed", "<pct>", "Motor speed while turning");
+    s_drum_calibrate_args.gate        = arg_int0("g", "gate", "<uT>", "Field that opens a magnet pass (default 3000)");
+    s_drum_calibrate_args.forward     = arg_lit0("f", "forward", "Turn the dispensing way, which empties the drum");
+    s_drum_calibrate_args.home_weak =
+        arg_lit0(NULL, "home-weak", "Slots 0 and 1 read weaker (default: they read stronger)");
+    s_drum_calibrate_args.zero    = arg_lit0("z", "zero", "Recapture the zero-field reference between magnets first");
+    s_drum_calibrate_args.dry_run = arg_lit0("n", "dry-run", "Measure and report without storing the map");
+    s_drum_calibrate_args.end     = arg_end(7);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "drum_calibrate",
+        .help     = "Turn the drum a few times, learn the field level of each slot and store the map",
+        .hint     = NULL,
+        .func     = &cmd_drum_calibrate,
+        .argtable = &s_drum_calibrate_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_drum_map_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command  = "drum_map",
+        .help     = "Show the active slot map",
+        .hint     = NULL,
+        .func     = &cmd_drum_map,
+        .argtable = NULL,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_drum_slot_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command  = "drum_slot",
+        .help     = "Show which slot is at the opening right now",
+        .hint     = NULL,
+        .func     = &cmd_drum_slot,
+        .argtable = NULL,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_drum_forget_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command  = "drum_forget",
+        .help     = "Erase the stored slot map",
+        .hint     = NULL,
+        .func     = &cmd_drum_forget,
+        .argtable = NULL,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_drum_calibrate(int argc, char **argv)
+{
+    dispenser_cal_config_t config = {0};
+    dispenser_cal_result_t result;
+    esp_err_t              err;
+
+    int errors = arg_parse(argc, argv, (void **) &s_drum_calibrate_args);
+    if (errors != 0)
+    {
+        arg_print_errors(stderr, s_drum_calibrate_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_drum_calibrate_args.revolutions->count > 0)
+    {
+        config.revolutions = (uint32_t) s_drum_calibrate_args.revolutions->ival[0];
+    }
+
+    if (s_drum_calibrate_args.speed->count > 0)
+    {
+        config.speed_pct = (uint32_t) s_drum_calibrate_args.speed->ival[0];
+    }
+
+    if (s_drum_calibrate_args.gate->count > 0)
+    {
+        config.gate_ut = s_drum_calibrate_args.gate->ival[0];
+    }
+
+    config.dispensing_direction = s_drum_calibrate_args.forward->count > 0;
+    config.home_pair_is_weaker  = s_drum_calibrate_args.home_weak->count > 0;
+    config.recalibrate_zero     = s_drum_calibrate_args.zero->count > 0;
+    config.skip_save            = s_drum_calibrate_args.dry_run->count > 0;
+
+    printf("Turning the drum, this takes a moment...\n");
+
+    err = dispenser_calibrate(s_drum_handle, &config, &result);
+    if (err != ESP_OK)
+    {
+        printf("Calibration failed (%s), see the log above for what went wrong\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    print_calibration(&result);
+    printf("Baseline between magnets %ld uT, %lu passes captured, map %s\n", (long) result.baseline_ut,
+           (unsigned long) result.peaks_seen, result.saved ? "stored" : "NOT stored (dry run)");
+    return 0;
+}
+
+static int cmd_drum_map(int argc, char **argv)
+{
+    dispenser_cal_result_t result;
+
+    esp_err_t err = dispenser_calibration_get(s_drum_handle, &result);
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        printf("No slot map, run drum_calibrate\n");
+        return 1;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf("Failed to read the map (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    print_calibration(&result);
+    return 0;
+}
+
+/*
+ * Both answers, because they disagree by design: the drum parks past the peak,
+ * so classifying the field as it stands can name a weaker slot than the magnet
+ * the drum is on. The remembered one is the answer to trust; the live one is
+ * here to show how far past the peak the drum came to rest.
+ */
+static int cmd_drum_slot(int argc, char **argv)
+{
+    int     slot;
+    int     live = DISPENSER_SLOT_NONE;
+    int32_t field_ut;
+
+    esp_err_t err = dispenser_get_slot(s_drum_handle, &slot);
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        printf("No slot map, run drum_calibrate\n");
+        return 1;
+    }
+
+    if (err != ESP_OK)
+    {
+        printf("Failed to read the slot (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (slot == DISPENSER_SLOT_NONE)
+    {
+        printf("Position unknown: move the drum once to establish it\n");
+    }
+    else
+    {
+        printf("Slot %d%s\n", slot, slot == DISPENSER_SLOT_HOME ? " (home)" : "");
+    }
+
+    if (drv5055_read_field_ut(s_hall_handle, &field_ut) == ESP_OK)
+    {
+        dispenser_classify_field(s_drum_handle, field_ut, &live);
+
+        printf("  field here ");
+        print_field_mt(field_ut);
+        if (live == DISPENSER_SLOT_NONE)
+        {
+            printf(", under the detection gate\n");
+        }
+        else
+        {
+            printf(", which on its own would read as slot %d\n", live);
+        }
+    }
+
+    return 0;
+}
+
+static esp_err_t register_locate_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command  = "locate",
+        .help     = "Back the drum off its magnet and turn forward over it again to find which slot it is on",
+        .hint     = NULL,
+        .func     = &cmd_locate,
+        .argtable = NULL,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_locate(int argc, char **argv)
+{
+    dispenser_result_t result;
+
+    esp_err_t err = dispenser_find_position(s_drum_handle, &result);
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        printf("No slot map, run drum_calibrate first\n");
+        return 1;
+    }
+
+    if (err != ESP_OK)
+    {
+        return report_move_error("work out which slot the drum is on", err);
+    }
+
+    if (result.already_there)
+    {
+        printf("Position already known: slot %d\n", result.slot);
+        return 0;
+    }
+
+    print_move_result(&result);
+    return 0;
+}
+
+static esp_err_t register_slot_command(void)
+{
+    s_slot_args.number = arg_int1(NULL, NULL, "<n>", "Slot to park at the opening (0 is home)");
+    s_slot_args.end    = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "slot",
+        .help     = "Turn the drum on until the given slot is at the opening, dispensing what it crosses",
+        .hint     = NULL,
+        .func     = &cmd_slot,
+        .argtable = &s_slot_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_slot(int argc, char **argv)
+{
+    dispenser_result_t result;
+    esp_err_t          err;
+    int                slot;
+
+    int errors = arg_parse(argc, argv, (void **) &s_slot_args);
+    if (errors != 0)
+    {
+        arg_print_errors(stderr, s_slot_args.end, argv[0]);
+        return 1;
+    }
+
+    slot = s_slot_args.number->ival[0];
+
+    err = dispenser_go_to_slot(s_drum_handle, slot, &s_manual_chime, &result);
+    if (err == ESP_ERR_INVALID_ARG)
+    {
+        printf("Slot must be 0 to %d\n", DISPENSER_SLOT_COUNT - 1);
+        return 1;
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        printf("No slot map, run drum_calibrate before asking for a slot by number\n");
+        return 1;
+    }
+
+    if (err != ESP_OK)
+    {
+        return report_move_error("reach that slot", err);
+    }
+
+    if (result.already_there)
+    {
+        printf("Already on slot %d\n", slot);
+        return 0;
+    }
+
+    print_move_result(&result);
+    return 0;
+}
+
+static int cmd_drum_forget(int argc, char **argv)
+{
+    esp_err_t err = dispenser_calibration_erase(s_drum_handle);
+    if (err != ESP_OK)
+    {
+        printf("Failed to erase the map (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Slot map erased\n");
+    return 0;
+}
+
+/*
+ * The levels are printed in slot order with their scatter, because a slot whose
+ * scatter approaches the margin is the one that will misread first.
+ */
+static void print_calibration(const dispenser_cal_result_t *result)
+{
+    int i;
+
+    for (i = 0; i < DISPENSER_SLOT_COUNT; i++)
+    {
+        printf("  slot %d%-7s %7ld uT  +/-%ld uT\n", i, i == DISPENSER_SLOT_HOME ? " (home)" : "",
+               (long) result->level_ut[i], (long) (result->spread_ut[i] / 2));
+    }
+
+    printf("  boundaries  %ld / %ld / %ld uT\n", (long) result->boundary_ut[0], (long) result->boundary_ut[1],
+           (long) result->boundary_ut[2]);
+    printf("  margin %ld uT, gate %ld uT, zero reference %ld mV\n", (long) result->margin_ut, (long) result->gate_ut,
+           (long) result->zero_mv);
 }

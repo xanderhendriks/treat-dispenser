@@ -69,6 +69,13 @@ typedef struct __attribute__((packed))
     uint8_t last_command; /* ble_remote_command_t of the last command, 0 for none */
     uint8_t last_result;  /* ble_remote_result_t */
     uint8_t at_home;      /* drum is parked on the home magnet, only meaningful while idle */
+
+    /*
+     * Slot at the opening, or BLE_REMOTE_SLOT_NONE. Appended after at_home
+     * rather than replacing it so that a phone built against the four-byte
+     * layout keeps working: it reads the bytes it knows and ignores this one.
+     */
+    uint8_t slot;
 } ble_remote_payload_t;
 
 /* Wall clock as the RV-3028 keeps it; there is no timezone, it is whatever was set */
@@ -146,6 +153,7 @@ static uint32_t  ble_remote_count_bonds(void);
 static void      ble_remote_build_payload(ble_remote_ctx_t *ctx, ble_remote_payload_t *out_payload);
 static void      ble_remote_notify_status(ble_remote_ctx_t *ctx);
 static uint8_t   ble_remote_map_result(esp_err_t err);
+static bool      ble_remote_is_slot_command(uint8_t opcode);
 
 static struct ble_gatt_chr_def ble_remote_characteristics[] = {
     {
@@ -668,7 +676,7 @@ static int ble_remote_command_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (opcode != BLE_REMOTE_COMMAND_HOME && opcode != BLE_REMOTE_COMMAND_ADVANCE &&
-        opcode != BLE_REMOTE_COMMAND_RETREAT)
+        opcode != BLE_REMOTE_COMMAND_RETREAT && !ble_remote_is_slot_command(opcode))
     {
         ESP_LOGW(TAG, "Unknown command 0x%02x", opcode);
         return BLE_ATT_ERR_UNLIKELY;
@@ -832,22 +840,29 @@ static void ble_remote_worker_task(void *arg)
         esp_err_t          err;
         dispenser_move_t   move;
 
-        switch (opcode)
+        if (ble_remote_is_slot_command(opcode))
         {
-            case BLE_REMOTE_COMMAND_HOME:
-                move = DISPENSER_MOVE_HOME;
-                break;
-
-            case BLE_REMOTE_COMMAND_RETREAT:
-                move = DISPENSER_MOVE_RETREAT;
-                break;
-
-            default:
-                move = DISPENSER_MOVE_ADVANCE;
-                break;
+            err = dispenser_go_to_slot(ctx->drum, opcode - BLE_REMOTE_COMMAND_SLOT_BASE, &ctx->remote_chime, &result);
         }
+        else
+        {
+            switch (opcode)
+            {
+                case BLE_REMOTE_COMMAND_HOME:
+                    move = DISPENSER_MOVE_HOME;
+                    break;
 
-        err = dispenser_move(ctx->drum, move, &ctx->remote_chime, &result);
+                case BLE_REMOTE_COMMAND_RETREAT:
+                    move = DISPENSER_MOVE_RETREAT;
+                    break;
+
+                default:
+                    move = DISPENSER_MOVE_ADVANCE;
+                    break;
+            }
+
+            err = dispenser_move(ctx->drum, move, &ctx->remote_chime, &result);
+        }
 
         if (err == ESP_OK)
         {
@@ -870,6 +885,7 @@ static void ble_remote_worker_task(void *arg)
 static void ble_remote_build_payload(ble_remote_ctx_t *ctx, ble_remote_payload_t *out_payload)
 {
     bool at_home = false;
+    int  slot    = DISPENSER_SLOT_NONE;
 
     xSemaphoreTake(ctx->lock, portMAX_DELAY);
     out_payload->state        = ctx->state;
@@ -882,9 +898,20 @@ static void ble_remote_build_payload(ble_remote_ctx_t *ctx, ble_remote_payload_t
     if (!busy)
     {
         dispenser_is_home(ctx->drum, &at_home);
+
+        /*
+         * Fails on a drum with no slot map, which is not worth reporting as an
+         * error: the slot simply cannot be named, same as parking between two
+         * magnets, and the app says so either way.
+         */
+        if (dispenser_get_slot(ctx->drum, &slot) != ESP_OK)
+        {
+            slot = DISPENSER_SLOT_NONE;
+        }
     }
 
     out_payload->at_home = at_home ? 1 : 0;
+    out_payload->slot    = slot == DISPENSER_SLOT_NONE ? BLE_REMOTE_SLOT_NONE : (uint8_t) slot;
 }
 
 static void ble_remote_notify_status(ble_remote_ctx_t *ctx)
@@ -995,12 +1022,21 @@ static uint32_t ble_remote_count_bonds(void)
     return (uint32_t) count;
 }
 
+/* Whether an opcode is one of the 0x10 + slot commands this drum has slots for */
+static bool ble_remote_is_slot_command(uint8_t opcode)
+{
+    return opcode >= BLE_REMOTE_COMMAND_SLOT_BASE && opcode < BLE_REMOTE_COMMAND_SLOT_BASE + DISPENSER_SLOT_COUNT;
+}
+
 static uint8_t ble_remote_map_result(esp_err_t err)
 {
     switch (err)
     {
         case ESP_OK:
             return BLE_REMOTE_RESULT_OK;
+
+        case ESP_ERR_INVALID_STATE:
+            return BLE_REMOTE_RESULT_NO_MAP;
 
         case ESP_ERR_TIMEOUT:
             return BLE_REMOTE_RESULT_TIMEOUT;

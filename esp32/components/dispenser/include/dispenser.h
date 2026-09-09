@@ -64,6 +64,8 @@ extern "C"
     typedef struct
     {
         int32_t  field_ut;       /* field measured after the drum came to a stop */
+        int32_t  peak_ut;        /* strongest field seen crossing the magnet, what the slot is judged on */
+        int      slot;           /* slot the move landed on, DISPENSER_SLOT_NONE when no map is active */
         uint32_t magnets_passed; /* magnets skipped before the target one was reached */
         uint32_t elapsed_ms;     /* time the motor ran */
         bool     already_there;  /* the drum was already parked on the target magnet, it did not move */
@@ -86,10 +88,15 @@ extern "C"
     /**
      * Turn the drum until it parks on the home magnet.
      *
-     * The home magnet is the one mounted with the opposite polarity to all the
-     * others, so it is the only one that reads as a negative field. Magnets of
-     * the normal polarity are counted and driven past. Returns immediately when
-     * the drum is already parked on the home magnet.
+     * Home is slot 0. With a slot map active it is recognised by its field level
+     * like any other slot, and the magnets of the other three are counted and
+     * driven past; without one, homing falls back to the older arrangement where
+     * home was the only magnet turned round and so the only one reading
+     * negative. Returns immediately when the drum is already parked on home.
+     *
+     * A magnet is judged by the strongest field seen while crossing it, not by
+     * the field at the moment it first trips the threshold, so a slot is
+     * identified from the peak whatever the drum does afterwards.
      *
      * Blocks until the magnet is found or the move times out, and always leaves
      * the motor stopped. On success the configured home chime starts playing in
@@ -99,8 +106,8 @@ extern "C"
      * @param out_result Receives details of the move, may be NULL.
      * @return ESP_OK on success, ESP_ERR_TIMEOUT when no magnet showed up within
      *         the configured budget, ESP_ERR_NOT_FOUND when a full drum of
-     *         magnets went by without a negative one, or an error from the motor
-     *         or Hall driver.
+     *         magnets went by without the home one, or an error from the motor or
+     *         Hall driver.
      */
     esp_err_t dispenser_home(dispenser_handle_t handle, dispenser_result_t *out_result);
 
@@ -161,6 +168,44 @@ extern "C"
                              dispenser_result_t *out_result);
 
     /**
+     * Turn the drum until the wanted slot is at the opening.
+     *
+     * The slot map makes position absolute, so any slot can be asked for by
+     * number rather than counted up to: the drum turns until the one wanted is
+     * at the opening, driving past the slots in between. Slot 0 is home, so
+     * asking for it does the same job as dispenser_home().
+     *
+     * It always turns the dispensing way, never taking a shorter way round
+     * backwards, because a move stops just past the peak of the magnet it
+     * settles on. Coming at every slot from the same side puts that overshoot on
+     * the same side too, and takes up the gear backlash the same way, so a slot
+     * lands in the same place every time rather than a step ahead or behind
+     * depending on where the drum came from.
+     *
+     * The cost is that reaching a slot can mean going most of the way round, and
+     * every pocket crossed passes the opening on the dispensing side, so this
+     * gives out treats exactly as dispenser_advance() does — up to
+     * DISPENSER_SLOT_COUNT - 1 of them.
+     *
+     * Blocks until the slot is reached or the move times out, and always leaves
+     * the motor stopped. Returns immediately when the drum is already parked on
+     * that slot, which is the one case where nothing is given out.
+     *
+     * @param handle Dispenser handle.
+     * @param slot Slot to park at, 0 to DISPENSER_SLOT_COUNT - 1.
+     * @param chime Chime to play on success, NULL for the configured advance
+     *              chime. A chime with a repeat_count of 0 stays silent.
+     * @param out_result Receives details of the move, may be NULL.
+     * @return ESP_OK on success, ESP_ERR_INVALID_ARG for a slot out of range,
+     *         ESP_ERR_INVALID_STATE when no slot map is active so slots cannot be
+     *         told apart, ESP_ERR_TIMEOUT when a magnet did not arrive within the
+     *         budget, ESP_ERR_NOT_FOUND when a full drum went by without that
+     *         slot, or an error from the motor or Hall driver.
+     */
+    esp_err_t dispenser_go_to_slot(dispenser_handle_t handle, int slot, const dispenser_chime_t *chime,
+                                   dispenser_result_t *out_result);
+
+    /**
      * Read whether the drum is currently parked on the home magnet.
      *
      * @param handle Dispenser handle.
@@ -192,7 +237,7 @@ extern "C"
         int32_t release_ut; /* magnitude that closes it again, 0 selects half the gate */
 
         bool dispensing_direction; /* turn the dispensing way; the default turns back so no treats fall out */
-        bool home_pair_is_weaker;  /* slots 0 and 1 sit further from the sensor than slots 2 and 3 */
+        bool home_pair_is_weaker;  /* slots 0 and 1 read weaker; the default is that they read stronger */
         bool recalibrate_zero;     /* capture a fresh zero-field reference before turning */
         bool skip_save;            /* leave non-volatile storage alone, just report what was measured */
     } dispenser_cal_config_t;
@@ -205,10 +250,11 @@ extern "C"
         int32_t boundary_ut[DISPENSER_SLOT_COUNT - 1]; /* decision boundaries, ascending */
         int32_t margin_ut;                             /* smallest gap between a level and its boundary */
 
-        int32_t  gate_ut;    /* magnitude below which no magnet is in front of the sensor */
-        int32_t  zero_mv;    /* zero-field reference the levels were measured against */
-        uint32_t peaks_seen; /* magnet passes captured */
-        bool     saved;      /* the map was written to non-volatile storage */
+        int32_t  gate_ut;     /* magnitude below which no magnet is in front of the sensor */
+        int32_t  zero_mv;     /* zero-field reference the levels were measured against */
+        uint32_t peaks_seen;  /* magnet passes captured */
+        int32_t  baseline_ut; /* mean field seen between magnets, a check on the zero reference */
+        bool     saved;       /* the map was written to non-volatile storage */
     } dispenser_cal_result_t;
 
     /**
@@ -225,7 +271,10 @@ extern "C"
      * two magnets sharing a height are on adjacent slots, so the run of two weak
      * levels followed by two strong ones can only line up with the drum one way.
      * home_pair_is_weaker says which of the two heights slots 0 and 1 are at, and
-     * is the one thing the routine cannot work out for itself.
+     * is the one thing the routine cannot work out for itself. It defaults to
+     * false, meaning slots 0 and 1 read stronger, which is what the Hall sensor
+     * sitting below the tray gives: slots 2 and 3 are the raised pair, so
+     * raising them moves them away from the sensor and weakens them.
      *
      * By default the drum turns the non-dispensing way so nothing falls out, but
      * run it on an empty drum regardless: several full revolutions go past the
@@ -290,15 +339,66 @@ extern "C"
     bool dispenser_is_calibrated(dispenser_handle_t handle);
 
     /**
+     * Find out which slot the drum is standing on, without sending it anywhere.
+     *
+     * Nothing says where a freshly powered drum is standing, and the field as it
+     * reads cannot be trusted to say either: the move that parked it stopped
+     * past the magnet's peak, so the field there has fallen off enough to look
+     * like a weaker slot. The way to find out is to measure a peak, and the way
+     * to measure a peak is to cross one.
+     *
+     * So the drum backs off the magnet it is on, far enough for the field to
+     * fall away, then turns forward again over the same magnet and stops on its
+     * peak. That names the slot, and it leaves the drum approached from the
+     * dispensing side exactly as dispenser_go_to_slot() would, so the position
+     * it settles at matches every later move rather than being wherever the last
+     * session happened to leave it.
+     *
+     * It stays on the slot it started on, backing off well under half a slot, so
+     * nothing crosses the opening and nothing is given out. The exception is a
+     * drum that starts parked between magnets, having been turned by hand: there
+     * is no magnet to back off, so the forward sweep runs on to the next slot
+     * and can give out what it crosses.
+     *
+     * Blocks for the two short moves and always leaves the motor stopped. Plays
+     * no chime, this being something the dispenser does to itself at start-up
+     * rather than a move anybody asked for.
+     *
+     * @param handle Dispenser handle.
+     * @param out_result Receives details of the forward sweep, may be NULL.
+     *                   already_there is set, and neither move made, when the
+     *                   position was known already.
+     * @return ESP_OK on success, ESP_ERR_INVALID_STATE when no slot map is
+     *         active so slots cannot be told apart, ESP_ERR_TIMEOUT when the drum
+     *         did not move as expected, or an error from the motor or Hall
+     *         driver.
+     */
+    esp_err_t dispenser_find_position(dispenser_handle_t handle, dispenser_result_t *out_result);
+
+    /**
      * Read which slot is at the opening.
      *
-     * Takes one Hall reading and matches it against the map. This is the whole
-     * point of calibrating: position comes from a single sample, with no homing
-     * run and no step counting.
+     * Reports the slot the last move settled on, which it judged from the peak
+     * field measured while the magnet was centred on the sensor. It is not a
+     * fresh classification of the field as it reads now: a move stops a little
+     * past the peak, so the field at rest has already fallen away and can sit in
+     * a weaker slot's band than the magnet the drum is actually on. Judging
+     * position from that reading names the wrong slot, which is why the answer
+     * comes from the move instead.
+     *
+     * The reading is still taken, as a check that the remembered slot has not
+     * gone stale: the drum has to still show the same pole with some field
+     * behind it. Turned away from its magnet by hand it does not, and the answer
+     * is then DISPENSER_SLOT_NONE rather than a slot the drum has left.
+     *
+     * Position is therefore unknown until the drum has been moved once, since
+     * nothing says where a drum that has only just been powered up is standing.
+     * Any move establishes it, dispenser_home() included.
      *
      * @param handle Dispenser handle.
      * @param out_slot Receives the slot number, or DISPENSER_SLOT_NONE when the
-     *                 drum is parked between magnets.
+     *                 drum has not been moved yet, was moved by hand since, or
+     *                 is parked between magnets.
      * @return ESP_OK on success, ESP_ERR_INVALID_STATE when no map is active, or
      *         an error from the Hall driver.
      */

@@ -9,6 +9,7 @@
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "max98357a.h"
+#include "melodies.h"
 #include "nvs_flash.h"
 #include "rv3028.h"
 #include "scheduler.h"
@@ -29,22 +30,6 @@
 #define DISPENSE_POLL_MS    10
 #define DISPENSE_TIMEOUT_MS 5000
 #define DISPENSE_BRAKE_MS   150
-
-/*
- * A tada marks arriving at the home position, and the Billy Joel hook plays
- * twice once a treat has been dispensed.
- *
- * The tada doubles as the short acknowledgement: it is what a move backwards
- * plays, having dispensed nothing worth singing about, and what any move driven
- * from the phone plays, the app already showing on screen that it finished.
- */
-#define HOME_MELODY        MAX98357A_MELODY_TADA
-#define HOME_MELODY_TIMES  1
-#define TREAT_MELODY       MAX98357A_MELODY_FOR_THE_LONGEST_TIME
-#define TREAT_MELODY_TIMES 2
-#define SHORT_MELODY       MAX98357A_MELODY_TADA
-#define SHORT_MELODY_TIMES 1
-#define MELODY_VOLUME_PCT  75
 
 /*
  * Feeding times. The RV-3028 alarm matches on hour and minute alone, so the
@@ -289,4 +274,31 @@ void app_main(void)
 
     ESP_ERROR_CHECK(console_start(i2c_bus, motor_handle, audio_handle, rtc_handle, pd_handle, hall_handle,
                                   supply_handle, drum_handle, schedule_handle, ble_handle));
+
+    /*
+     * Find out where the drum is standing before anything asks. Left until now
+     * so that the console and the phone are already up: the nudge takes a
+     * moment, and the app showing "position not known" turning into a slot
+     * number is friendlier than a board that says nothing while it moves.
+     *
+     * A drum that has never been calibrated has no slots to tell apart, which is
+     * not an error worth stopping the boot for; it just leaves the position
+     * unknown until drum_calibrate has been run.
+     */
+    dispenser_result_t start_position;
+
+    err = dispenser_find_position(drum_handle, &start_position);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Drum is on slot %d%s", start_position.slot,
+                 start_position.already_there ? ", already known" : "");
+    }
+    else if (err == ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "No slot map, so the drum position stays unknown until it is calibrated");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Could not work out which slot the drum is on (%s)", esp_err_to_name(err));
+    }
 }

@@ -20,7 +20,22 @@ extern "C"
         BLE_REMOTE_COMMAND_HOME    = 0x01, /* park the drum on the home magnet */
         BLE_REMOTE_COMMAND_ADVANCE = 0x02, /* turn on to the next magnet, dispensing a treat */
         BLE_REMOTE_COMMAND_RETREAT = 0x03, /* turn back to the previous magnet, dispensing nothing */
+
+        /*
+         * 0x10 plus a slot number parks that slot at the opening, so 0x10 to
+         * 0x13 cover a four-slot drum. Slot 0 is home, making 0x10 another way
+         * to write BLE_REMOTE_COMMAND_HOME. Needs a calibrated drum: without a
+         * slot map the firmware answers BLE_REMOTE_RESULT_NO_MAP.
+         */
+        BLE_REMOTE_COMMAND_SLOT_BASE = 0x10,
     } ble_remote_command_t;
+
+/*
+ * Fifth byte of the status characteristic when the drum is not sitting on a slot
+ * that can be named: parked between magnets, still turning, or on a drum with no
+ * slot map at all.
+ */
+#define BLE_REMOTE_SLOT_NONE 0xff
 
     /* First byte of the status characteristic */
     typedef enum
@@ -42,8 +57,9 @@ extern "C"
         BLE_REMOTE_RESULT_NONE      = 0x00, /* nothing has been asked for yet */
         BLE_REMOTE_RESULT_OK        = 0x01,
         BLE_REMOTE_RESULT_TIMEOUT   = 0x02, /* no magnet arrived within the budget */
-        BLE_REMOTE_RESULT_NOT_FOUND = 0x03, /* a full drum went by without the home magnet */
+        BLE_REMOTE_RESULT_NOT_FOUND = 0x03, /* a full drum went by without the slot asked for */
         BLE_REMOTE_RESULT_FAILED    = 0x04, /* anything else the motion layer reported */
+        BLE_REMOTE_RESULT_NO_MAP    = 0x05, /* the drum has no slot map, so slots cannot be told apart */
     } ble_remote_result_t;
 
     typedef struct
