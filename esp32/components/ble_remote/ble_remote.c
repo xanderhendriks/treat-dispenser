@@ -31,6 +31,15 @@ void ble_store_config_init(void);
  */
 #define BLE_REMOTE_DEFAULT_PAIRING_MS 60000
 
+/*
+ * How long a connected phone has to get the link encrypted before it is hung
+ * up on. Everything worth reaching asks for encryption, so a phone that holds
+ * the one connection slot without encrypting has nothing useful to do with it.
+ * Android re-encrypts a bonded link as soon as it connects, so this only ever
+ * expires on a stranger or on a phone whose keys we no longer have.
+ */
+#define BLE_REMOTE_ENCRYPT_DEADLINE_MS 10000
+
 /* A treat is a treat; there is no point queueing more than a couple of presses */
 #define BLE_REMOTE_QUEUE_LENGTH 4
 
@@ -108,6 +117,8 @@ typedef struct ble_remote_t
     bool               pairing_open;
     int64_t            pairing_closes_us;
 
+    esp_timer_handle_t encrypt_timer;
+
     uint8_t  own_addr_type;
     uint16_t conn_handle;
     bool     connected;
@@ -147,8 +158,8 @@ static int  ble_remote_schedule_access(uint16_t conn_handle, uint16_t attr_handl
                                        void *arg);
 static esp_err_t ble_remote_register_services(void);
 static void      ble_remote_pairing_expired(void *arg);
+static void      ble_remote_encrypt_expired(void *arg);
 static void      ble_remote_set_pairing(ble_remote_ctx_t *ctx, bool open);
-static bool      ble_remote_peer_is_bonded(const ble_addr_t *peer_id_addr);
 static uint32_t  ble_remote_count_bonds(void);
 static void      ble_remote_build_payload(ble_remote_ctx_t *ctx, ble_remote_payload_t *out_payload);
 static void      ble_remote_notify_status(ble_remote_ctx_t *ctx);
@@ -255,6 +266,19 @@ esp_err_t ble_remote_start(const ble_remote_config_t *config, ble_remote_handle_
         goto fail;
     }
 
+    const esp_timer_create_args_t encrypt_timer_args = {
+        .callback = ble_remote_encrypt_expired,
+        .arg      = ctx,
+        .name     = "ble_encrypt",
+    };
+
+    err = esp_timer_create(&encrypt_timer_args, &ctx->encrypt_timer);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create the encryption timer (%s)", esp_err_to_name(err));
+        goto fail;
+    }
+
     if (xTaskCreate(ble_remote_worker_task, "ble_remote",
                     config->task_stack_size ? config->task_stack_size : BLE_REMOTE_DEFAULT_STACK_SIZE, ctx,
                     config->task_priority ? (UBaseType_t) config->task_priority : BLE_REMOTE_DEFAULT_PRIORITY,
@@ -331,6 +355,11 @@ fail:
     if (ctx->pairing_timer)
     {
         esp_timer_delete(ctx->pairing_timer);
+    }
+
+    if (ctx->encrypt_timer)
+    {
+        esp_timer_delete(ctx->encrypt_timer);
     }
 
     if (ctx->lock)
@@ -547,24 +576,6 @@ static int ble_remote_gap_event(struct ble_gap_event *event, void *arg)
             }
 
             xSemaphoreTake(ctx->lock, portMAX_DELAY);
-            pairing_open = ctx->pairing_open;
-            xSemaphoreGive(ctx->lock);
-
-            /*
-             * With the window shut only a phone we already hold keys for is
-             * let in. An unbonded peer could not drive the drum anyway, every
-             * characteristic asking for encryption, but dropping it here keeps
-             * the single connection slot free for the phone that owns the
-             * dispenser.
-             */
-            if (!pairing_open && !ble_remote_peer_is_bonded(&desc.peer_id_addr))
-            {
-                ESP_LOGW(TAG, "Rejecting an unbonded phone, the pairing window is shut");
-                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                break;
-            }
-
-            xSemaphoreTake(ctx->lock, portMAX_DELAY);
             ctx->conn_handle    = event->connect.conn_handle;
             ctx->connected      = true;
             ctx->encrypted      = desc.sec_state.encrypted;
@@ -572,10 +583,37 @@ static int ble_remote_gap_event(struct ble_gap_event *event, void *arg)
             xSemaphoreGive(ctx->lock);
 
             ESP_LOGI(TAG, "Connected, handle %u", (unsigned) event->connect.conn_handle);
+
+            /*
+             * Whether the phone belongs here is answered by whether the link
+             * encrypts, not by the address it arrives on. Matching the peer
+             * against the bond store at this point looks like the cheaper
+             * check, but the address is only the phone's identity once the
+             * controller has resolved it, and it can only resolve a phone that
+             * handed over an IRK when it paired. One that did not connects
+             * from a private address that rotates, so it never matches the
+             * bond it genuinely holds, and gets turned away every time the
+             * pairing window is shut. Every characteristic asks for encryption
+             * anyway, so a phone that cannot encrypt was never getting in;
+             * this only delays saying so until the link has had its chance to.
+             */
+            if (!desc.sec_state.encrypted)
+            {
+                esp_timer_stop(ctx->encrypt_timer);
+
+                esp_err_t timer_err =
+                    esp_timer_start_once(ctx->encrypt_timer, (uint64_t) BLE_REMOTE_ENCRYPT_DEADLINE_MS * 1000);
+                if (timer_err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Failed to arm the encryption timer (%s)", esp_err_to_name(timer_err));
+                }
+            }
             break;
 
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "Disconnected, reason %d", event->disconnect.reason);
+
+            esp_timer_stop(ctx->encrypt_timer);
 
             xSemaphoreTake(ctx->lock, portMAX_DELAY);
             ctx->conn_handle    = BLE_HS_CONN_HANDLE_NONE;
@@ -593,6 +631,11 @@ static int ble_remote_gap_event(struct ble_gap_event *event, void *arg)
                 xSemaphoreTake(ctx->lock, portMAX_DELAY);
                 ctx->encrypted = desc.sec_state.encrypted;
                 xSemaphoreGive(ctx->lock);
+
+                if (desc.sec_state.encrypted)
+                {
+                    esp_timer_stop(ctx->encrypt_timer);
+                }
 
                 ESP_LOGI(TAG, "Link %s, bonded=%d", desc.sec_state.encrypted ? "encrypted" : "not encrypted",
                          desc.sec_state.bonded);
@@ -949,6 +992,24 @@ static void ble_remote_pairing_expired(void *arg)
     ble_remote_set_pairing(arg, false);
 }
 
+static void ble_remote_encrypt_expired(void *arg)
+{
+    ble_remote_ctx_t *ctx = arg;
+    uint16_t          conn_handle;
+
+    xSemaphoreTake(ctx->lock, portMAX_DELAY);
+    conn_handle = (ctx->connected && !ctx->encrypted) ? ctx->conn_handle : BLE_HS_CONN_HANDLE_NONE;
+    xSemaphoreGive(ctx->lock);
+
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE)
+    {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Hanging up on a phone that never encrypted the link");
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+
 static void ble_remote_set_pairing(ble_remote_ctx_t *ctx, bool open)
 {
     xSemaphoreTake(ctx->lock, portMAX_DELAY);
@@ -989,32 +1050,18 @@ static void ble_remote_set_pairing(ble_remote_ctx_t *ctx, bool open)
  * at pairing time. A phone we hold no IRK for cannot be resolved, which is
  * exactly the answer wanted: it is not bonded.
  */
-static bool ble_remote_peer_is_bonded(const ble_addr_t *peer_id_addr)
+
+static uint32_t ble_remote_count_bonds(void)
 {
     ble_addr_t peers[BLE_REMOTE_MAX_BONDS];
     int        count = 0;
 
+    /*
+     * The keys we handed out, not the ones the phone handed us. A phone that
+     * pairs legacy need distribute nothing at all, so counting its records
+     * would report no bonds for a phone that is perfectly able to come back.
+     */
     if (ble_store_util_bonded_peers(peers, &count, BLE_REMOTE_MAX_BONDS) != 0)
-    {
-        return false;
-    }
-
-    for (int i = 0; i < count; i++)
-    {
-        if (ble_addr_cmp(&peers[i], peer_id_addr) == 0)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static uint32_t ble_remote_count_bonds(void)
-{
-    int count = 0;
-
-    if (ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &count) != 0)
     {
         return 0;
     }

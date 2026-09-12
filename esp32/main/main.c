@@ -8,11 +8,15 @@
 #include "drv8871.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "gc9a01a.h"
 #include "max98357a.h"
 #include "melodies.h"
 #include "nvs_flash.h"
 #include "rv3028.h"
 #include "scheduler.h"
+#include "screen.h"
 #include "vsense.h"
 
 /* Treat dispenser board: DRV8871 IN1 on GPIO4, IN2 on GPIO5 */
@@ -60,6 +64,75 @@
 #define SUPPLY_OVERVOLTAGE_MV      10500
 #define SUPPLY_RANGE_HYSTERESIS_MV 250
 
+/*
+ * ER-TFTM1.28-1 round display: a 240x240 GC9A01A on 4-wire SPI. MOSI on GPIO11
+ * and SCK on GPIO12 are the ESP32-S3 IOMUX pins for SPI2, so the clock is not
+ * held down to what the GPIO matrix can pass; R14 and R15 put 33R in series
+ * with both. The backlight is PWM on BLK, which has to keep clear of LEDC
+ * timer 0 and channels 0 and 1 that the motor driver already holds.
+ *
+ * Rotation 90 is what the assembled enclosure needs, the flex tail leaving the
+ * glass a quarter turn round from the frame memory's own idea of up.
+ */
+#define DISPLAY_SPI_HOST          SPI2_HOST
+#define DISPLAY_CS_GPIO_NUM       9
+#define DISPLAY_DC_GPIO_NUM       10
+#define DISPLAY_MOSI_GPIO_NUM     11
+#define DISPLAY_SCK_GPIO_NUM      12
+#define DISPLAY_RES_GPIO_NUM      13
+#define DISPLAY_BLK_GPIO_NUM      14
+#define DISPLAY_ROTATION          GC9A01A_ROTATION_90
+#define DISPLAY_BACKLIGHT_PCT     80
+#define DISPLAY_BACKLIGHT_FADE_MS 400
+
+/*
+ * Screen care for a face that shows a live countdown. The countdown redraws
+ * every second, so the picture is never static for long and the drawing code
+ * deliberately does not report those redraws as activity: that would reset the
+ * idle clock every second and the panel would never dim, never nudge and never
+ * sleep.
+ *
+ * Blanking is off. The board has no button, no touch panel and nothing else a
+ * person can press, so a blanked panel would stay dark until the next feeding
+ * time or a phone connection woke it. Dimming to a third is enough: the panel
+ * is bright enough to read dim, and it is black background with thin white
+ * strokes, which is the least stressed state the glass has. Turning blanking
+ * back on is a supported choice and the screen copes with it, the display then
+ * lighting up at each feeding time and going dark ten minutes later.
+ */
+#define DISPLAY_DIM_AFTER_MS   300000
+#define DISPLAY_DIM_PCT        30
+#define DISPLAY_BLANK_AFTER_MS GC9A01A_CARE_NEVER
+
+/*
+ * The clock face does not stay in one place. Once a minute it steps to the next
+ * of eight positions round a ring twelve pixels out from the middle, which is
+ * far enough that a segment lands clear of where it was: a step has to be wider
+ * than the stroke to be worth anything, and the strokes here are five pixels.
+ * Each position is then occupied an eighth of the time, and one full circuit
+ * takes eight minutes.
+ *
+ * Twelve pixels because of how it looks rather than because of what fits: the
+ * three row layout would allow nineteen, but a nineteen pixel hop once a minute
+ * reads as the face jumping rather than drifting, and twelve already steps eight
+ * and a half pixels at a time against a five pixel stroke. The screen clamps
+ * this to whatever the layout actually affords, so growing something on the face
+ * costs travel and says so rather than pushing anything under the bezel.
+ */
+#define DISPLAY_DRIFT_INTERVAL_MS 60000
+#define DISPLAY_DRIFT_RADIUS_PX   12
+
+/*
+ * Start-up sequence. The dog is on the glass from the first frame and stays
+ * there while the drum goes looking for itself, which is the one part of the
+ * boot that takes a visible moment; a tada says it found itself, and the face
+ * arrives a couple of seconds after that. Holding him rather than timing him
+ * out is why the screen takes SCREEN_CELEBRATE_HOLD: nobody knows in advance how
+ * long the drum will take, and a portrait that vanished mid-move would look like
+ * a fault rather than a greeting.
+ */
+#define DISPLAY_SPLASH_LINGER_MS 2000
+
 /* Shared I2C bus: RV-3028-C7 RTC at 0x52, CH224A USB-PD sink at 0x22 or 0x23 */
 #define I2C_SDA_GPIO_NUM 6
 #define I2C_SCL_GPIO_NUM 7
@@ -83,6 +156,8 @@
 
 static const char *TAG = "main";
 
+static void main_on_drum_move(bool moving, void *ctx);
+
 void app_main(void)
 {
     adc_oneshot_unit_handle_t adc1_unit       = NULL;
@@ -96,6 +171,8 @@ void app_main(void)
     dispenser_handle_t        drum_handle     = NULL;
     scheduler_handle_t        schedule_handle = NULL;
     ble_remote_handle_t       ble_handle      = NULL;
+    gc9a01a_handle_t          display_handle  = NULL;
+    screen_handle_t           screen_handle   = NULL;
 
     drv8871_config_t motor_cfg = {
         .in1_gpio_num     = MOTOR_IN1_GPIO_NUM,
@@ -170,6 +247,39 @@ void app_main(void)
                 .volume_pct   = MELODY_VOLUME_PCT,
             },
     };
+    gc9a01a_config_t display_cfg = {
+        .spi_host                   = DISPLAY_SPI_HOST,
+        .sck_gpio_num               = DISPLAY_SCK_GPIO_NUM,
+        .mosi_gpio_num              = DISPLAY_MOSI_GPIO_NUM,
+        .cs_gpio_num                = DISPLAY_CS_GPIO_NUM,
+        .dc_gpio_num                = DISPLAY_DC_GPIO_NUM,
+        .rst_gpio_num               = DISPLAY_RES_GPIO_NUM,
+        .backlight_gpio_num         = DISPLAY_BLK_GPIO_NUM,
+        .spi_clock_speed_hz         = 0,
+        .rotation                   = DISPLAY_ROTATION,
+        .dot_inversion              = GC9A01A_DOT_INVERSION_4_DOT,
+        .backlight_pwm_timer        = LEDC_TIMER_1,
+        .backlight_pwm_channel      = LEDC_CHANNEL_2,
+        .backlight_pwm_frequency_hz = 0,
+        .transfer_chunk_bytes       = 0,
+    };
+    gc9a01a_care_config_t display_care_cfg = {
+        .nudge_after_ms     = 0, /* the datasheet's own advice: shift a long lived border every minute */
+        .dim_after_ms       = DISPLAY_DIM_AFTER_MS,
+        .blank_after_ms     = DISPLAY_BLANK_AFTER_MS,
+        .warn_after_ms      = 0,
+        .dim_backlight_pct  = DISPLAY_DIM_PCT,
+        .nudge_amplitude_px = 0,
+        .task_stack_size    = 0,
+        .task_priority      = 0,
+    };
+    screen_config_t screen_cfg = {
+        .drift_interval_ms = DISPLAY_DRIFT_INTERVAL_MS,
+        .drift_radius_px   = DISPLAY_DRIFT_RADIUS_PX,
+        .splash            = true,
+        .task_stack_size   = 0,
+        .task_priority     = 0,
+    };
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port                     = -1, /* auto-select */
         .sda_io_num                   = I2C_SDA_GPIO_NUM,
@@ -214,6 +324,29 @@ void app_main(void)
     ESP_ERROR_CHECK(max98357a_init(&audio_cfg, &audio_handle));
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc1_cfg, &adc1_unit));
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
+
+    /*
+     * The display is decoration: a board that cannot bring it up still feeds
+     * the dog, so a failure here is logged and stepped over. The panel comes up
+     * with its frame memory cleared and the backlight off, and stays that way
+     * until the clock face has drawn its first frame further down, which saves
+     * showing anybody a lit black circle while the rest of the board starts.
+     */
+    esp_err_t display_err = gc9a01a_init(&display_cfg, &display_handle);
+    if (display_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display unavailable (%s), continuing without it", esp_err_to_name(display_err));
+        display_handle = NULL;
+    }
+    else
+    {
+        display_err = gc9a01a_care_start(display_handle, &display_care_cfg);
+        if (display_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Screen care unavailable (%s), nothing is watching for image sticking",
+                     esp_err_to_name(display_err));
+        }
+    }
 
     hall_cfg.adc_unit   = adc1_unit;
     supply_cfg.adc_unit = adc1_unit;
@@ -272,8 +405,33 @@ void app_main(void)
         ble_handle = NULL;
     }
 
+    /*
+     * The clock face needs the RTC for the time, the schedule for what it is
+     * counting down to and the radio for the Bluetooth icon, so it goes up after
+     * all three. It draws its first frame before returning, which is why the
+     * backlight only comes on afterwards.
+     */
+    if (display_handle)
+    {
+        screen_cfg.display_handle  = display_handle;
+        screen_cfg.rtc_handle      = rtc_handle;
+        screen_cfg.schedule_handle = schedule_handle;
+        screen_cfg.ble_handle      = ble_handle;
+        screen_cfg.audio_handle    = audio_handle;
+
+        err = screen_start(&screen_cfg, &screen_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Clock face unavailable (%s), the display stays blank", esp_err_to_name(err));
+            screen_handle = NULL;
+        }
+
+        gc9a01a_fade_backlight(display_handle, DISPLAY_BACKLIGHT_PCT, DISPLAY_BACKLIGHT_FADE_MS);
+    }
+
     ESP_ERROR_CHECK(console_start(i2c_bus, motor_handle, audio_handle, rtc_handle, pd_handle, hall_handle,
-                                  supply_handle, drum_handle, schedule_handle, ble_handle));
+                                  supply_handle, drum_handle, schedule_handle, ble_handle, display_handle,
+                                  screen_handle));
 
     /*
      * Find out where the drum is standing before anything asks. Left until now
@@ -292,6 +450,14 @@ void app_main(void)
     {
         ESP_LOGI(TAG, "Drum is on slot %d%s", start_position.slot,
                  start_position.already_there ? ", already known" : "");
+
+        /*
+         * dispenser_find_position() stays deliberately quiet, being a move
+         * nobody asked for, so the tada that says the dispenser is up and knows
+         * where it is belongs here. Only on success: a triumphant noise over a
+         * drum that has no idea where it is would be a lie.
+         */
+        max98357a_play(audio_handle, HOME_MELODY, HOME_MELODY_TIMES, MELODY_VOLUME_PCT);
     }
     else if (err == ESP_ERR_INVALID_STATE)
     {
@@ -301,4 +467,29 @@ void app_main(void)
     {
         ESP_LOGE(TAG, "Could not work out which slot the drum is on (%s)", esp_err_to_name(err));
     }
+
+    /* Playback runs in the background, so the tada carries on over this wait rather than delaying it */
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_SPLASH_LINGER_MS));
+    screen_celebrate(screen_handle, 0);
+
+    /*
+     * From here on the dog goes up whenever the drum turns, wherever the order
+     * came from. Hooked up only now, after the start-up sequence has finished
+     * with him: the move above would otherwise have ended the splash early,
+     * finding a drum that had stopped and no chime yet to wait on.
+     */
+    if (screen_handle)
+    {
+        dispenser_set_move_observer(drum_handle, main_on_drum_move, screen_handle);
+    }
+}
+
+/*
+ * Hold him while the drum turns, then until the chime it ends on has finished.
+ * Runs in whichever task asked for the move: the schedule, the phone or the
+ * console.
+ */
+static void main_on_drum_move(bool moving, void *ctx)
+{
+    screen_celebrate((screen_handle_t) ctx, moving ? SCREEN_CELEBRATE_HOLD : SCREEN_CELEBRATE_UNTIL_QUIET);
 }

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Turn an image into an RGB565 asset the GC9A01A driver can blit.
+
+    img2rgb565.py dog.png --size 56 --name dog_badge --out components/screen/assets
+
+Writes <name>.c and <name>.h next to each other. The array is host order
+uint16_t, which is what gc9a01a_draw_bitmap() takes: it byte swaps into its own
+DMA buffer on the way out, so nothing here has to care about the wire order.
+The array is const, so it lives in flash rather than RAM.
+
+Needs Pillow, which the ESP-IDF image does not carry:
+
+    python3 -m venv ~/.venvs/imgtools
+    ~/.venvs/imgtools/bin/pip install pillow
+    ~/.venvs/imgtools/bin/python esp32/tools/img2rgb565.py ...
+
+Two things worth knowing about the conversion. RGB565 keeps 5 bits of red and
+blue and 6 of green, so smooth gradients band badly, worst of all in the dark
+tones where a black dog spends most of its time; the ordered dither below
+scatters the rounding error instead of letting it pool into visible steps.
+And the panel has no alpha, so transparency is composited onto a background
+colour, black by default because that is what the clock face is drawn on.
+"""
+
+import argparse
+import os
+import sys
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit(__doc__.split('Needs Pillow')[1].strip().join(('Pillow is missing.\n\n', '\n')))
+
+# 4x4 ordered dither, the classic Bayer matrix scaled to 0..15
+BAYER = (
+    (0, 8, 2, 10),
+    (12, 4, 14, 6),
+    (3, 11, 1, 9),
+    (15, 7, 13, 5),
+)
+
+CHANNEL_BITS = (5, 6, 5)  # red, green, blue
+
+
+def quantize(value, bits, bias):
+    """One channel to `bits` bits, the dither bias nudging which way it rounds."""
+    step = 256 >> bits
+    value = int(value + bias * step)
+    value = max(0, min(255, value))
+    return value >> (8 - bits)
+
+
+def to_rgb565(image, dither):
+    pixels = image.load()
+    width, height = image.size
+    words = []
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y][:3]
+            if dither:
+                bias = BAYER[y % 4][x % 4] / 16.0 - 0.5
+            else:
+                bias = 0.0
+            words.append((quantize(r, CHANNEL_BITS[0], bias) << 11) |
+                         (quantize(g, CHANNEL_BITS[1], bias) << 5) |
+                         quantize(b, CHANNEL_BITS[2], bias))
+
+    return words
+
+
+def mask_to_circle(image, background):
+    """Blank the corners, for an asset that fills the whole round panel."""
+    pixels = image.load()
+    width, height = image.size
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    radius = min(cx, cy)
+
+    for y in range(height):
+        for x in range(width):
+            if (x - cx) ** 2 + (y - cy) ** 2 > radius ** 2:
+                pixels[x, y] = background
+
+
+TRIM_ALPHA_THRESHOLD = 16
+
+
+def trim_to_content(image):
+    """Crop away the fully transparent border.
+
+    Worth doing before anything else, because every pixel of empty margin is a
+    pixel of the panel cell not spent on the subject. The threshold ignores a
+    faint halo that would otherwise defeat the trim.
+    """
+    solid = image.split()[3].point(lambda v: 255 if v > TRIM_ALPHA_THRESHOLD else 0)
+    bbox = solid.getbbox()
+
+    return image.crop(bbox) if bbox else image
+
+
+def crop_edges(image, crop):
+    """Trim fractions off each edge.
+
+    Note what this deliberately does not do: pad the result back out to square.
+    Padding undoes the crop, because the scale that follows is set by the longest
+    side either way, so the subject ends up exactly as small as it started and
+    short of whatever was cut off. Let --size choose the output shape instead.
+    """
+    left, top, right, bottom = crop
+    width, height = image.size
+
+    return image.crop((int(width * left), int(height * top),
+                       width - int(width * right), height - int(height * bottom)))
+
+
+def load(path, size, background, circle, crop, trim):
+    image = Image.open(path)
+
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+
+    if trim:
+        before = image.size
+        image = trim_to_content(image)
+        print('trimmed %dx%d to %dx%d of content' % (before + image.size), file=sys.stderr)
+
+    if crop:
+        image = crop_edges(image, crop)
+
+    if size:
+        stretch = (size[0] / size[1]) / (image.width / image.height)
+        if abs(stretch - 1.0) > 0.02:
+            print('note: %dx%d into %dx%d stretches the width by %+.0f%%'
+                  % (image.size + size + (100 * (stretch - 1),)), file=sys.stderr)
+        image = image.resize(size, Image.LANCZOS)
+
+    flat = Image.new('RGB', image.size, background)
+    flat.paste(image, mask=image.split()[3])
+
+    if circle:
+        mask_to_circle(flat, background)
+
+    return flat
+
+
+def emit(words, width, height, name, out_dir, source):
+    guard = name.upper()
+    os.makedirs(out_dir, exist_ok=True)
+
+    header = os.path.join(out_dir, name + '.h')
+    with open(header, 'w', newline='\n') as f:
+        f.write('/* Generated by tools/img2rgb565.py from %s, do not edit. */\n\n' % source)
+        f.write('#pragma once\n\n#include <stdint.h>\n\n')
+        f.write('#define %s_WIDTH  %d\n' % (guard, width))
+        f.write('#define %s_HEIGHT %d\n\n' % (guard, height))
+        f.write('/* RGB565 in host order, row major, for gc9a01a_draw_bitmap(). */\n')
+        f.write('extern const uint16_t %s[%s_WIDTH * %s_HEIGHT];\n' % (name, guard, guard))
+
+    body = os.path.join(out_dir, name + '.c')
+    with open(body, 'w', newline='\n') as f:
+        f.write('/* Generated by tools/img2rgb565.py from %s, do not edit. */\n\n' % source)
+        f.write('#include "%s.h"\n\n' % name)
+        f.write('const uint16_t %s[%s_WIDTH * %s_HEIGHT] = {\n' % (name, guard, guard))
+        for row in range(height):
+            line = words[row * width:(row + 1) * width]
+            f.write('    /* row %3d */ ' % row)
+            f.write(' '.join('0x%04X,' % w for w in line))
+            f.write('\n')
+        f.write('};\n')
+
+    return header, body
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('image')
+    parser.add_argument('--size', help='output size, either N for a square or WxH; the panel does not care '
+                                       'whether an asset is square, so matching the subject beats padding it')
+    parser.add_argument('--trim', action='store_true',
+                        help='crop away the transparent border first, so none of the output is empty margin')
+    parser.add_argument('--name', required=True, help='C identifier for the array')
+    parser.add_argument('--out', required=True, help='directory for the generated .c and .h')
+    parser.add_argument('--background', default='000000',
+                        help='RRGGBB behind any transparency (default black, which is what the face uses)')
+    parser.add_argument('--circle', action='store_true',
+                        help='blank the corners, for an asset that fills the whole round panel')
+    parser.add_argument('--crop', metavar='L,T,R,B',
+                        help='fractions to trim off each edge before scaling, then padded back to square '
+                             '(e.g. 0,0,0,0.12 to take an eighth off the bottom)')
+    parser.add_argument('--no-dither', action='store_true', help='truncate instead of dithering')
+    args = parser.parse_args()
+
+    background = tuple(int(args.background[i:i + 2], 16) for i in (0, 2, 4))
+
+    crop = None
+    if args.crop:
+        crop = tuple(float(part) for part in args.crop.split(','))
+        if len(crop) != 4 or not all(0.0 <= part < 0.5 for part in crop):
+            sys.exit('--crop wants four fractions between 0 and 0.5, as L,T,R,B')
+
+    size = None
+    if args.size:
+        try:
+            parts = [int(part) for part in args.size.lower().split('x')]
+        except ValueError:
+            sys.exit('--size wants N or WxH')
+        if len(parts) == 1:
+            size = (parts[0], parts[0])
+        elif len(parts) == 2:
+            size = (parts[0], parts[1])
+        else:
+            sys.exit('--size wants N or WxH')
+        if min(size) < 1:
+            sys.exit('--size wants positive numbers')
+
+    image = load(args.image, size, background, args.circle, crop, args.trim)
+    words = to_rgb565(image, not args.no_dither)
+    header, body = emit(words, image.width, image.height, args.name, args.out,
+                        os.path.basename(args.image))
+
+    print('%s: %dx%d, %d bytes of flash' % (args.name, image.width, image.height, len(words) * 2))
+    print('  %s' % header)
+    print('  %s' % body)
+
+
+if __name__ == '__main__':
+    main()

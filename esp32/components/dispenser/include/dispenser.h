@@ -215,6 +215,36 @@ extern "C"
     esp_err_t dispenser_is_home(dispenser_handle_t handle, bool *out_home);
 
     /**
+     * Called as a move begins and again once it has finished.
+     *
+     * The second call comes after the chime has been started rather than after
+     * it has finished, playback running in its own task; an observer that wants
+     * to wait for the sound can watch max98357a_is_playing() from there.
+     *
+     * Runs in whichever task asked for the move, with no dispenser lock held.
+     */
+    typedef void (*dispenser_move_cb_t)(bool moving, void *ctx);
+
+    /**
+     * Watch the drum turn.
+     *
+     * One observer, called around every move that dispenser_move() and
+     * dispenser_go_to_slot() make, which is every move anything asks for: the
+     * schedule, the phone and the console all arrive through those two.
+     *
+     * Deliberately not called for dispenser_find_position() or
+     * dispenser_calibrate(). Those turn the drum too, but they are the dispenser
+     * seeing to itself rather than giving anything out, and neither plays a
+     * chime for an observer to wait on.
+     *
+     * @param handle Dispenser handle.
+     * @param callback Observer, or NULL to stop watching.
+     * @param ctx Passed back to the callback.
+     * @return ESP_OK on success.
+     */
+    esp_err_t dispenser_set_move_observer(dispenser_handle_t handle, dispenser_move_cb_t callback, void *ctx);
+
+    /**
      * Set the motor speed used for moves, in percent.
      *
      * @param handle Dispenser handle.

@@ -102,6 +102,9 @@ typedef struct dispenser_t
     drv5055_handle_t   hall;
     max98357a_handle_t audio;
 
+    dispenser_move_cb_t move_cb;
+    void               *move_cb_ctx;
+
     dispenser_chime_t home_chime;
     dispenser_chime_t advance_chime;
     dispenser_chime_t retreat_chime;
@@ -137,6 +140,7 @@ static const char *TAG = "dispenser";
 static esp_err_t dispenser_seek(dispenser_ctx_t *ctx, dispenser_move_t move, int target_slot,
                                 dispenser_result_t *out_result);
 static void      dispenser_play_chime(dispenser_ctx_t *ctx, const dispenser_chime_t *chime);
+static void      dispenser_notify_move(dispenser_ctx_t *ctx, bool moving);
 
 static const dispenser_chime_t *dispenser_move_chime(const dispenser_ctx_t *ctx, dispenser_move_t move);
 static drv8871_direction_t      dispenser_move_direction(const dispenser_ctx_t *ctx, dispenser_move_t move);
@@ -259,6 +263,8 @@ esp_err_t dispenser_move(dispenser_handle_t handle, dispenser_move_t move, const
         return ESP_ERR_INVALID_ARG;
     }
 
+    dispenser_notify_move(handle, true);
+
     /* Homing hunts for slot 0; a plain advance or retreat takes whatever comes next */
     err = dispenser_seek(handle, move, move == DISPENSER_MOVE_HOME ? DISPENSER_SLOT_HOME : DISPENSER_SLOT_NONE,
                          out_result);
@@ -266,6 +272,9 @@ esp_err_t dispenser_move(dispenser_handle_t handle, dispenser_move_t move, const
     {
         dispenser_play_chime(handle, chime ? chime : dispenser_move_chime(handle, move));
     }
+
+    /* Told on every path, including a jam, so that nothing is left waiting on a move that failed */
+    dispenser_notify_move(handle, false);
 
     return err;
 }
@@ -296,11 +305,15 @@ esp_err_t dispenser_go_to_slot(dispenser_handle_t handle, int slot, const dispen
      */
     ESP_LOGI(TAG, "Going to slot %d, turning on", slot);
 
+    dispenser_notify_move(handle, true);
+
     err = dispenser_seek(handle, DISPENSER_MOVE_ADVANCE, slot, out_result);
     if (err == ESP_OK)
     {
         dispenser_play_chime(handle, chime ? chime : dispenser_move_chime(handle, DISPENSER_MOVE_ADVANCE));
     }
+
+    dispenser_notify_move(handle, false);
 
     return err;
 }
@@ -658,6 +671,27 @@ static void dispenser_play_chime(dispenser_ctx_t *ctx, const dispenser_chime_t *
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to play the chime (%s)", esp_err_to_name(err));
+    }
+}
+
+esp_err_t dispenser_set_move_observer(dispenser_handle_t handle, dispenser_move_cb_t callback, void *ctx)
+{
+    if (!handle)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    handle->move_cb     = callback;
+    handle->move_cb_ctx = ctx;
+
+    return ESP_OK;
+}
+
+static void dispenser_notify_move(dispenser_ctx_t *ctx, bool moving)
+{
+    if (ctx->move_cb)
+    {
+        ctx->move_cb(moving, ctx->move_cb_ctx);
     }
 }
 

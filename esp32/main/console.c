@@ -34,12 +34,18 @@ static vsense_handle_t         s_supply_handle;
 static dispenser_handle_t      s_drum_handle;
 static scheduler_handle_t      s_schedule_handle;
 static ble_remote_handle_t     s_ble_handle;
+static gc9a01a_handle_t        s_display_handle;
+static screen_handle_t         s_screen_handle;
 static esp_console_repl_t     *s_repl;
 
 /* i2c_scan sweeps the 7-bit addresses that are not reserved by the standard */
 #define I2C_SCAN_FIRST_ADDRESS 0x08
 #define I2C_SCAN_LAST_ADDRESS  0x77
 #define I2C_SCAN_TIMEOUT_MS    50
+
+/* dog holds the portrait up for a while; long enough to be silly, short enough not to be a nuisance */
+#define DOG_DEFAULT_SECONDS 5
+#define DOG_MAX_SECONDS     60
 
 /* hall_watch polls fast enough to catch a magnet sweeping past, and reports at a readable rate */
 #define HALL_WATCH_POLL_MS     50
@@ -137,6 +143,37 @@ typedef struct drum_calibrate_args
     struct arg_end *end;
 } drum_calibrate_args_t;
 
+typedef struct display_fill_args
+{
+    struct arg_str *color;
+    struct arg_end *end;
+} display_fill_args_t;
+
+typedef struct display_backlight_args
+{
+    struct arg_int *percent;
+    struct arg_int *fade;
+    struct arg_end *end;
+} display_backlight_args_t;
+
+typedef struct display_rotation_args
+{
+    struct arg_int *quarters;
+    struct arg_end *end;
+} display_rotation_args_t;
+
+typedef struct display_soak_args
+{
+    struct arg_int *minutes;
+    struct arg_end *end;
+} display_soak_args_t;
+
+typedef struct dog_args
+{
+    struct arg_int *seconds;
+    struct arg_end *end;
+} dog_args_t;
+
 static speed_args_t          s_speed_args;
 static direction_args_t      s_direction_args;
 static play_args_t           s_play_args;
@@ -146,11 +183,16 @@ static pd_voltage_args_t     s_pd_voltage_args;
 static hall_watch_args_t     s_hall_watch_args;
 static hall_threshold_args_t s_hall_threshold_args;
 
-static supply_calibrate_args_t s_supply_calibrate_args;
-static supply_range_args_t     s_supply_range_args;
-static dispense_speed_args_t   s_dispense_speed_args;
-static drum_calibrate_args_t   s_drum_calibrate_args;
-static slot_args_t             s_slot_args;
+static supply_calibrate_args_t  s_supply_calibrate_args;
+static supply_range_args_t      s_supply_range_args;
+static dispense_speed_args_t    s_dispense_speed_args;
+static drum_calibrate_args_t    s_drum_calibrate_args;
+static slot_args_t              s_slot_args;
+static display_fill_args_t      s_display_fill_args;
+static display_backlight_args_t s_display_backlight_args;
+static display_rotation_args_t  s_display_rotation_args;
+static display_soak_args_t      s_display_soak_args;
+static dog_args_t               s_dog_args;
 
 static esp_err_t register_speed_command(void);
 static esp_err_t register_direction_command(void);
@@ -187,6 +229,14 @@ static esp_err_t register_drum_slot_command(void);
 static esp_err_t register_drum_forget_command(void);
 static esp_err_t register_slot_command(void);
 static esp_err_t register_locate_command(void);
+static esp_err_t register_display_command(void);
+static esp_err_t register_display_test_command(void);
+static esp_err_t register_display_fill_command(void);
+static esp_err_t register_display_backlight_command(void);
+static esp_err_t register_display_rotation_command(void);
+static esp_err_t register_display_soak_command(void);
+static esp_err_t register_screen_command(void);
+static esp_err_t register_dog_command(void);
 
 static int cmd_speed(int argc, char **argv);
 static int cmd_direction(int argc, char **argv);
@@ -223,22 +273,36 @@ static int cmd_drum_slot(int argc, char **argv);
 static int cmd_drum_forget(int argc, char **argv);
 static int cmd_slot(int argc, char **argv);
 static int cmd_locate(int argc, char **argv);
+static int cmd_display(int argc, char **argv);
+static int cmd_display_test(int argc, char **argv);
+static int cmd_display_fill(int argc, char **argv);
+static int cmd_display_backlight(int argc, char **argv);
+static int cmd_display_rotation(int argc, char **argv);
+static int cmd_display_soak(int argc, char **argv);
+static int cmd_screen(int argc, char **argv);
+static int cmd_dog(int argc, char **argv);
 
-static void print_hall_reading(const drv5055_reading_t *reading);
-static void print_supply_reading(const vsense_reading_t *reading);
-static void print_move_result(const dispenser_result_t *result);
-static void print_field_mt(int32_t field_ut);
-static int  report_move_error(const char *what, esp_err_t err);
-static void print_calibration(const dispenser_cal_result_t *result);
+static void        print_hall_reading(const drv5055_reading_t *reading);
+static void        print_supply_reading(const vsense_reading_t *reading);
+static void        print_move_result(const dispenser_result_t *result);
+static void        print_field_mt(int32_t field_ut);
+static int         report_move_error(const char *what, esp_err_t err);
+static void        print_calibration(const dispenser_cal_result_t *result);
+static int         require_display(void);
+static const char *care_state_name(gc9a01a_care_state_t state);
+static bool        parse_color(const char *text, uint16_t *out_color);
+static uint16_t    test_pattern_hue(uint16_t x);
 
 esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_handle, max98357a_handle_t audio_handle,
                         rv3028_handle_t rtc_handle, ch224a_handle_t pd_handle, drv5055_handle_t hall_handle,
                         vsense_handle_t supply_handle, dispenser_handle_t drum_handle,
-                        scheduler_handle_t schedule_handle, ble_remote_handle_t ble_handle)
+                        scheduler_handle_t schedule_handle, ble_remote_handle_t ble_handle,
+                        gc9a01a_handle_t display_handle, screen_handle_t screen_handle)
 {
     esp_err_t err;
 
-    /* rtc_handle, pd_handle, schedule_handle and ble_handle may be NULL when that part is unavailable */
+    /* rtc_handle, pd_handle, schedule_handle, ble_handle and display_handle may be NULL when that part is unavailable
+     */
     if (i2c_bus == NULL || motor_handle == NULL || audio_handle == NULL || hall_handle == NULL ||
         supply_handle == NULL || drum_handle == NULL)
     {
@@ -255,6 +319,8 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     s_drum_handle     = drum_handle;
     s_schedule_handle = schedule_handle;
     s_ble_handle      = ble_handle;
+    s_display_handle  = display_handle;
+    s_screen_handle   = screen_handle;
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt                    = "treat_dispenser>";
@@ -513,6 +579,62 @@ esp_err_t console_start(i2c_master_bus_handle_t i2c_bus, drv8871_handle_t motor_
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register locate command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_test_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display_test command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_fill_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display_fill command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_backlight_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display_backlight command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_rotation_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display_rotation command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_display_soak_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register display_soak command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_screen_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register screen command (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = register_dog_command();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register dog command (%s)", esp_err_to_name(err));
         return err;
     }
 
@@ -2193,4 +2315,537 @@ static void print_calibration(const dispenser_cal_result_t *result)
            (long) result->boundary_ut[2]);
     printf("  margin %ld uT, gate %ld uT, zero reference %ld mV\n", (long) result->margin_ut, (long) result->gate_ut,
            (long) result->zero_mv);
+}
+
+static esp_err_t register_display_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "display",
+        .help    = "Show the panel state and what the screen care policy is doing",
+        .hint    = NULL,
+        .func    = &cmd_display,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_display_test_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "display_test",
+        .help    = "Draw a test pattern, for checking the panel wiring and which way up it sits",
+        .hint    = NULL,
+        .func    = &cmd_display_test,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_display_fill_command(void)
+{
+    s_display_fill_args.color =
+        arg_str1(NULL, NULL, "<color>", "black, white, red, green, blue, cyan, magenta, yellow, grey, or 0xRGB565");
+    s_display_fill_args.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "display_fill",
+        .help     = "Fill the whole panel with one colour",
+        .hint     = NULL,
+        .func     = &cmd_display_fill,
+        .argtable = &s_display_fill_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_display_backlight_command(void)
+{
+    s_display_backlight_args.percent = arg_int0(NULL, NULL, "<pct>", "Duty cycle 0-100, omit to just read it back");
+    s_display_backlight_args.fade    = arg_int0(NULL, NULL, "<ms>", "Ramp time, 0 for an immediate step");
+    s_display_backlight_args.end     = arg_end(2);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "display_backlight",
+        .help     = "Show or set the backlight duty cycle",
+        .hint     = NULL,
+        .func     = &cmd_display_backlight,
+        .argtable = &s_display_backlight_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_display_rotation_command(void)
+{
+    s_display_rotation_args.quarters = arg_int1(NULL, NULL, "<0-3>", "Quarter turns clockwise");
+    s_display_rotation_args.end      = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "display_rotation",
+        .help     = "Rotate the panel, for working out which way the flex tail leaves it sitting",
+        .hint     = NULL,
+        .func     = &cmd_display_rotation,
+        .argtable = &s_display_rotation_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static esp_err_t register_display_soak_command(void)
+{
+    s_display_soak_args.minutes = arg_int1(NULL, NULL, "<minutes>", "How long to soak, 0 to stop one");
+    s_display_soak_args.end     = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "display_soak",
+        .help     = "Hold the panel on black for hours, to unwind an image that has stuck",
+        .hint     = NULL,
+        .func     = &cmd_display_soak,
+        .argtable = &s_display_soak_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_display(int argc, char **argv)
+{
+    gc9a01a_rotation_t    rotation;
+    gc9a01a_care_status_t care;
+    uint8_t               backlight_pct;
+
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    gc9a01a_get_rotation(s_display_handle, &rotation);
+    gc9a01a_get_backlight(s_display_handle, &backlight_pct);
+
+    printf("%dx%d, rotated %d degrees, backlight %u%%\n", GC9A01A_WIDTH, GC9A01A_HEIGHT, rotation * 90,
+           (unsigned) backlight_pct);
+
+    if (s_screen_handle)
+    {
+        bool    suspended = false;
+        int16_t dx        = 0;
+        int16_t dy        = 0;
+
+        screen_is_suspended(s_screen_handle, &suspended);
+        screen_get_offset(s_screen_handle, &dx, &dy);
+        printf("Clock face %s, sitting %+d,%+d from the middle\n",
+               suspended ? "paused, run screen to bring it back" : "drawing", dx, dy);
+    }
+    else
+    {
+        printf("No clock face\n");
+    }
+
+    esp_err_t err = gc9a01a_care_get_status(s_display_handle, &care);
+    if (err != ESP_OK)
+    {
+        printf("Screen care is not running, so nothing is watching for image sticking\n");
+        return 0;
+    }
+
+    printf("Screen care %s, same picture for %lu s", care_state_name(care.state),
+           (unsigned long) (care.static_ms / 1000));
+
+    if (care.nudge_offset_px)
+    {
+        printf(", nudged %u px", (unsigned) care.nudge_offset_px);
+    }
+    if (care.soak_remaining_s)
+    {
+        printf(", %lu s of soak left", (unsigned long) care.soak_remaining_s);
+    }
+
+    printf("\n");
+    return 0;
+}
+
+/*
+ * Enough to tell whether the panel, its wiring and its orientation are all
+ * right, and nothing more than that. The grey wedge shows the gamma and that
+ * the panel is not stuck inverted, the hue wedge shows the channels are not
+ * swapped, and the four coloured tabs say which edge is which: red is the top
+ * of the frame, green the right, blue the bottom and white the left.
+ */
+static int cmd_display_test(int argc, char **argv)
+{
+    uint16_t *row;
+    uint16_t  y;
+    uint16_t  x;
+
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    row = malloc(GC9A01A_WIDTH * sizeof(uint16_t));
+    if (!row)
+    {
+        printf("Out of memory\n");
+        return 1;
+    }
+
+    /* The clock face redraws twice a second, so it has to let go of the panel first */
+    screen_suspend(s_screen_handle);
+    gc9a01a_care_touch(s_display_handle);
+    gc9a01a_fill(s_display_handle, GC9A01A_GREY_MID);
+
+    for (x = 0; x < GC9A01A_WIDTH; x++)
+    {
+        uint8_t level = (uint8_t) (x * 255 / (GC9A01A_WIDTH - 1));
+
+        row[x] = GC9A01A_RGB565(level, level, level);
+    }
+    for (y = 96; y < 120; y++)
+    {
+        gc9a01a_draw_bitmap(s_display_handle, 0, y, GC9A01A_WIDTH, 1, row);
+    }
+
+    for (x = 0; x < GC9A01A_WIDTH; x++)
+    {
+        row[x] = test_pattern_hue(x);
+    }
+    for (y = 120; y < 144; y++)
+    {
+        gc9a01a_draw_bitmap(s_display_handle, 0, y, GC9A01A_WIDTH, 1, row);
+    }
+
+    free(row);
+
+    gc9a01a_fill_rect(s_display_handle, 100, 8, 40, 14, GC9A01A_RED);
+    gc9a01a_fill_rect(s_display_handle, 218, 100, 14, 40, GC9A01A_GREEN);
+    gc9a01a_fill_rect(s_display_handle, 100, 218, 40, 14, GC9A01A_BLUE);
+    gc9a01a_fill_rect(s_display_handle, 8, 100, 14, 40, GC9A01A_WHITE);
+    gc9a01a_fill_rect(s_display_handle, 116, 116, 8, 8, GC9A01A_BLACK);
+
+    printf("Test pattern drawn: red tab is the top of the frame, then green, blue and white clockwise\n");
+    printf("The clock face is paused, run screen to bring it back\n");
+    return 0;
+}
+
+static int cmd_display_fill(int argc, char **argv)
+{
+    uint16_t color;
+
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_display_fill_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_display_fill_args.end, argv[0]);
+        return 1;
+    }
+
+    if (!parse_color(s_display_fill_args.color->sval[0], &color))
+    {
+        printf("Unknown colour, use a name or an RGB565 value like 0xF800\n");
+        return 1;
+    }
+
+    screen_suspend(s_screen_handle);
+    gc9a01a_care_touch(s_display_handle);
+
+    esp_err_t err = gc9a01a_fill(s_display_handle, color);
+    if (err != ESP_OK)
+    {
+        printf("Failed to fill the panel (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Filled with 0x%04X, the clock face is paused; run screen to bring it back\n", color);
+    return 0;
+}
+
+static int cmd_display_backlight(int argc, char **argv)
+{
+    uint8_t percent;
+
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_display_backlight_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_display_backlight_args.end, argv[0]);
+        return 1;
+    }
+
+    if (s_display_backlight_args.percent->count > 0)
+    {
+        int requested = s_display_backlight_args.percent->ival[0];
+        int fade_ms   = s_display_backlight_args.fade->count > 0 ? s_display_backlight_args.fade->ival[0] : 0;
+
+        if (requested < 0 || requested > 100 || fade_ms < 0)
+        {
+            printf("Duty cycle is 0-100 and the ramp cannot be negative\n");
+            return 1;
+        }
+
+        esp_err_t err = gc9a01a_fade_backlight(s_display_handle, (uint8_t) requested, (uint32_t) fade_ms);
+        if (err != ESP_OK)
+        {
+            printf("Failed to set the backlight (%s)\n", esp_err_to_name(err));
+            return 1;
+        }
+    }
+
+    gc9a01a_get_backlight(s_display_handle, &percent);
+    printf("Backlight %u%%\n", (unsigned) percent);
+    return 0;
+}
+
+static int cmd_display_rotation(int argc, char **argv)
+{
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_display_rotation_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_display_rotation_args.end, argv[0]);
+        return 1;
+    }
+
+    int quarters = s_display_rotation_args.quarters->ival[0];
+    if (quarters < 0 || quarters > 3)
+    {
+        printf("Rotation is 0 to 3 quarter turns\n");
+        return 1;
+    }
+
+    esp_err_t err = gc9a01a_set_rotation(s_display_handle, (gc9a01a_rotation_t) quarters);
+    if (err != ESP_OK)
+    {
+        printf("Failed to rotate the panel (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    /* Frame memory is re-scanned the other way round, so whatever is up there is now sideways until it is redrawn */
+    printf("Rotated %d degrees, redraw to see it properly\n", quarters * 90);
+    return 0;
+}
+
+static int cmd_display_soak(int argc, char **argv)
+{
+    if (require_display() != 0)
+    {
+        return 1;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_display_soak_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_display_soak_args.end, argv[0]);
+        return 1;
+    }
+
+    int minutes = s_display_soak_args.minutes->ival[0];
+    if (minutes < 0)
+    {
+        printf("Soak time cannot be negative\n");
+        return 1;
+    }
+
+    esp_err_t err = gc9a01a_care_soak(s_display_handle, (uint32_t) minutes);
+    if (err != ESP_OK)
+    {
+        printf("Failed to start the soak (%s), screen care has to be running for this\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (minutes == 0)
+    {
+        printf("Soak stopped\n");
+    }
+    else
+    {
+        printf(
+            "Soaking for %d minutes; the panel datasheet asks for four to six hours to clear a ghost, and less "
+            "if the panel is warm\n",
+            minutes);
+    }
+
+    return 0;
+}
+
+static int require_display(void)
+{
+    if (!s_display_handle)
+    {
+        printf("The display did not start, see the boot log for the reason\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static const char *care_state_name(gc9a01a_care_state_t state)
+{
+    switch (state)
+    {
+        case GC9A01A_CARE_STATE_ACTIVE:
+            return "active";
+        case GC9A01A_CARE_STATE_NUDGED:
+            return "nudging a static picture";
+        case GC9A01A_CARE_STATE_DIMMED:
+            return "dimmed";
+        case GC9A01A_CARE_STATE_BLANKED:
+            return "blanked, panel asleep and draining";
+        case GC9A01A_CARE_STATE_SOAKING:
+            return "soaking in black";
+        default:
+            return "unknown";
+    }
+}
+
+static bool parse_color(const char *text, uint16_t *out_color)
+{
+    static const struct
+    {
+        const char *name;
+        uint16_t    value;
+    } names[] = {
+        {"black", GC9A01A_BLACK},     {"white", GC9A01A_WHITE},   {"red", GC9A01A_RED},
+        {"green", GC9A01A_GREEN},     {"blue", GC9A01A_BLUE},     {"cyan", GC9A01A_CYAN},
+        {"magenta", GC9A01A_MAGENTA}, {"yellow", GC9A01A_YELLOW}, {"grey", GC9A01A_GREY_MID},
+        {"gray", GC9A01A_GREY_MID},
+    };
+    char         *end;
+    unsigned long value;
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        if (strcmp(text, names[i].name) == 0)
+        {
+            *out_color = names[i].value;
+            return true;
+        }
+    }
+
+    value = strtoul(text, &end, 0);
+    if (*end != '\0' || value > 0xFFFF)
+    {
+        return false;
+    }
+
+    *out_color = (uint16_t) value;
+    return true;
+}
+
+/*
+ * A red to green to blue sweep across the width, which is what says the colour
+ * channels arrive in the order the driver thinks they do. Getting the BGR bit
+ * in MADCTL wrong shows up here as red and blue trading places.
+ */
+static uint16_t test_pattern_hue(uint16_t x)
+{
+    int span  = GC9A01A_WIDTH;
+    int phase = (x * 3) / span;
+    int step  = (x * 3) % span;
+    int up    = step * 255 / (span - 1);
+    int down  = 255 - up;
+
+    switch (phase)
+    {
+        case 0:
+            return GC9A01A_RGB565(down, up, 0);
+        case 1:
+            return GC9A01A_RGB565(0, down, up);
+        default:
+            return GC9A01A_RGB565(up, 0, down);
+    }
+}
+
+static esp_err_t register_screen_command(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "screen",
+        .help    = "Repaint the clock face and take the panel back from a test pattern",
+        .hint    = NULL,
+        .func    = &cmd_screen,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_screen(int argc, char **argv)
+{
+    if (s_screen_handle == NULL)
+    {
+        printf("No clock face, see the boot log for the reason\n");
+        return 1;
+    }
+
+    esp_err_t err = screen_resume(s_screen_handle);
+    if (err != ESP_OK)
+    {
+        printf("Failed to repaint the clock face (%s)\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("Clock face drawing again\n");
+    return 0;
+}
+
+static esp_err_t register_dog_command(void)
+{
+    s_dog_args.seconds = arg_int0(NULL, NULL, "<seconds>", "How long to hold it, 0 to cut one short");
+    s_dog_args.end     = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command  = "dog",
+        .help     = "Put the dog up on the panel, the same as a dispensed treat does",
+        .hint     = NULL,
+        .func     = &cmd_dog,
+        .argtable = &s_dog_args,
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+
+static int cmd_dog(int argc, char **argv)
+{
+    if (s_screen_handle == NULL)
+    {
+        printf("No clock face, see the boot log for the reason\n");
+        return 1;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &s_dog_args);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, s_dog_args.end, argv[0]);
+        return 1;
+    }
+
+    int seconds = s_dog_args.seconds->count > 0 ? s_dog_args.seconds->ival[0] : DOG_DEFAULT_SECONDS;
+    if (seconds < 0 || seconds > DOG_MAX_SECONDS)
+    {
+        printf("Hold time is 0 to %d seconds\n", DOG_MAX_SECONDS);
+        return 1;
+    }
+
+    /* The screen picks this up on its next tick, so it lands within a quarter second */
+    screen_celebrate(s_screen_handle, (uint32_t) seconds * 1000);
+
+    if (seconds == 0)
+    {
+        printf("Clock face coming back\n");
+    }
+    else
+    {
+        printf("Dog up for %d seconds\n", seconds);
+    }
+
+    return 0;
 }
